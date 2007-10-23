@@ -2,9 +2,9 @@
 # You can tweak these three variables to make things install where you
 # like, but do not touch more unless you know what you are doing. ;)
 #
-SYSCONFDIR=/usr/local/etc
-BINDIR=/usr/local/bin
-MANDIR=/usr/local/man
+SYSCONFDIR=$(DESTDIR)/etc
+BINDIR=$(DESTDIR)/usr/sbin
+MANDIR=$(DESTDIR)/usr/share/man
 
 #
 # Careful now...
