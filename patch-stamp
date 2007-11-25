@@ -1,3 +1,0 @@
-debian/patches/01-make.dpatch (David Kubicek <dave@awk.cz>):
-  Change installation paths in Makefile
-

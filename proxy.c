@@ -23,9 +23,10 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -53,12 +54,12 @@
 #include "swap.h"
 #include "config.h"
 #include "acl.h"
+#include "auth.h"
+#include "http.h"
 #include "pages.c"
 
 #define DEFAULT_PORT	"3128"
 
-#define BLOCK		2048
-#define MINIBUF_SIZE	100
 #define SAMPLE		4096
 #define STACK_SIZE	sizeof(void *)*8*1024
 
@@ -76,41 +77,34 @@
 #define GET(data)	(data && data->req && !strcasecmp("GET", data->method))
 
 /*
- * Global read-only data initialized in main(). Comments list funcs. which use
+ * Global "read-only" data initialized in main(). Comments list funcs. which use
  * them. Having these global avoids the need to pass them to each thread and
  * from there again a few times to inner calls.
  */
 int debug = 0;						/* all debug printf's and possibly external modules */
 
-static char *user;					/* authenticate() */
-static char *domain;
-static char *workstation;
-static char *passlm = NULL;
-static char *passnt = NULL;
-static char *passntlm2 = NULL;
-static int hashntlm2 = 1;
-static int hashnt = 0;
-static int hashlm = 0;
-static uint32_t flags = 0;
+static struct auth_s *creds = NULL;			/* throughout the whole module */
 
 static int quit = 0;					/* sighandler() */
 static int asdaemon = 1;				/* myexit() */
-static int ntlmbasic = 0;				/* process() */
+static int ntlmbasic = 0;				/* proxy_thread() */
 static int serialize = 0;
 static int scanner_plugin = 0;
 static long scanner_plugin_maxsize = 0;
 
 static int precache = 0;
+static int active_conns = 0;
+static pthread_mutex_t active_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * List of finished threads. Each thread process() adds itself to it when
+ * List of finished threads. Each thread proxy_thread() adds itself to it when
  * finished. Main regularly joins and removes all tid's in there.
  */
 static plist_t threads_list = NULL;
 static pthread_mutex_t threads_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * List of cached connections. Accessed by each thread process().
+ * List of cached connections. Accessed by each thread proxy_thread().
  */
 static plist_t connection_list = NULL;
 static pthread_mutex_t connection_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -129,13 +123,15 @@ typedef struct {
 } proxy_t;
 
 /*
- * List of custom header substitutions.
+ * List of custom header substitutions, SOCKS5 proxy users and 
+ * UserAgents for the scanner plugin.
  */
-static hlist_t header_list = NULL;			/* process() */
+static hlist_t header_list = NULL;			/* proxy_thread() */
+static hlist_t users_list = NULL;			/* socks5_thread() */
 static plist_t scanner_agent_list = NULL;		/* scanner_hook() */
 
 /*
- * General signal handler. Fast exit, no waiting for threads and shit.
+ * General signal handler. If in debug mode, quit immediately.
  */
 void sighandler(int p) {
 	if (!quit)
@@ -144,7 +140,7 @@ void sighandler(int p) {
 		syslog(LOG_INFO, "Signal %d received, forcing shutdown\n", p);
 
 	if (quit++ || debug)
-		exit(0);
+		quit++;
 }
 
 void myexit(int rc) {
@@ -152,6 +148,28 @@ void myexit(int rc) {
 		fprintf(stderr, "Exitting with error. Check daemon logs or run with -v.\n");
 	
 	exit(rc);
+}
+
+/*
+ * Keep count of active connections (trasferring data)
+ */
+void update_active(int i) {
+	pthread_mutex_lock(&active_mtx);
+	active_conns += i;
+	pthread_mutex_unlock(&active_mtx);
+}
+
+/*
+ * Retur/ count of active connections (trasferring data)
+ */
+int check_active(void) {
+	int r;
+
+	pthread_mutex_lock(&active_mtx);
+	r = active_conns;
+	pthread_mutex_unlock(&active_mtx);
+
+	return r;
 }
 
 /*
@@ -269,7 +287,7 @@ int parent_add(char *parent, int port) {
 /*
  * Register and bind new proxy service port.
  */
-void listen_add(plist_t *list, char *spec, int gateway) {
+void listen_add(const char *service, plist_t *list, char *spec, int gateway) {
 	struct in_addr source;
 	int i, p, len, port;
 	char *tmp;
@@ -297,7 +315,7 @@ void listen_add(plist_t *list, char *spec, int gateway) {
 	i = so_listen(port, source);
 	if (i > 0) {
 		*list = plist_add(*list, i, NULL);
-		syslog(LOG_INFO, "Proxy listening on %s:%d\n", inet_ntoa(source), port);
+		syslog(LOG_INFO, "%s listening on %s:%d\n", service, inet_ntoa(source), port);
 	}
 }
 
@@ -361,400 +379,6 @@ void tunnel_add(plist_t *list, char *spec, int gateway) {
 }
 
 /*
- * Receive HTTP request/response from the given socket. Fill in pre-allocated
- * rr_data_t structure.
- * Returns: 1 if OK, 0 in case of socket EOF or other error
- */
-int headers_recv(int fd, rr_data_t data) {
-	char *tok, *s3;
-	int len;
-	char *buf;
-	char *ccode = NULL;
-	char *host = NULL;
-	int i, bsize;
-
-	bsize = BUFSIZE;
-	buf = new(bsize);
-
-	i = so_recvln(fd, &buf, &bsize);
-	if (i <= 0)
-		goto bailout;
-
-	if (debug)
-		printf("HEAD: %s", buf);
-
-	/*
-	 * Are we reading HTTP request (from client) or response (from server)?
-	 */
-	trimr(buf);
-	len = strlen(buf);
-	tok = strtok_r(buf, " ", &s3);
-	if (!strncasecmp(buf, "HTTP/", 5) && tok) {
-		data->req = 0;
-		data->http = NULL;
-		data->msg = NULL;
-
-		data->http = substr(tok, 7, 1);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok) {
-			ccode = strdup(tok);
-
-			tok += strlen(ccode);
-			while (tok < buf+len && *tok++ == ' ');
-
-			if (strlen(tok))
-				data->msg = strdup(tok);
-		}
-
-		if (!data->msg)
-			data->msg = strdup("");
-
-		if (!ccode || strlen(ccode) != 3 || (data->code = atoi(ccode)) == 0 || !data->http) {
-			i = -1;
-			goto bailout;
-		}
-	} else if (tok) {
-		data->req = 1;
-		data->method = NULL;
-		data->url = NULL;
-		data->http = NULL;
-
-		data->method = strdup(tok);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok)
-			data->url = strdup(tok);
-
-		tok = strtok_r(NULL, " ", &s3);
-		if (tok)
-			data->http = substr(tok, 7, 1);
-
-		if (!data->url || !data->http) {
-			i = -1;
-			goto bailout;
-		}
-
-		tok = strstr(data->url, "://");
-		if (tok) {
-			s3 = strchr(tok+3, '/');
-			host = substr(tok+3, 0, s3 ? s3-tok-3 : 0);
-		}
-	} else {
-		if (debug)
-			printf("headers_recv: Unknown header (%s).\n", buf);
-		i = -1;
-		goto bailout;
-	}
-
-	/*
-	 * Read in all headers, do not touch any possible HTTP body
-	 */
-	do {
-		i = so_recvln(fd, &buf, &bsize);
-		trimr(buf);
-		if (i > 0 && head_ok(buf)) {
-			data->headers = hlist_add(data->headers, head_name(buf), head_value(buf), 0, 0);
-		}
-	} while (strlen(buf) != 0 && i > 0);
-
-	if (host && !hlist_in(data->headers, "Host"))
-		data->headers = hlist_add(data->headers, "Host", host, 1, 1);
-
-bailout:
-	if (ccode) free(ccode);
-	if (host) free(host);
-	free(buf);
-
-	if (i <= 0) {
-		if (debug)
-			printf("headers_recv: fd %d warning %d (connection closed)\n", fd, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Send HTTP request/response to the given socket based on what's in "data".
- * Returns: 1 if OK, 0 in case of socket error
- */
-int headers_send(int fd, rr_data_t data) {
-	hlist_t t;
-	char *buf;
-	int i, len;
-
-	/*
-	 * First compute required buffer size (avoid realloc, etc)
-	 */
-	if (data->req)
-		len = 20 + strlen(data->method) + strlen(data->url) + strlen(data->http);
-	else
-		len = 20 + strlen(data->http) + strlen(data->msg);
-
-	t = data->headers;
-	while (t) {
-		len += 20 + strlen(t->key) + strlen(t->value);
-		t = t->next;
-	}
-
-	/*
-	 * We know how much memory we need now...
-	 */
-	buf = new(len);
-
-	/*
-	 * Prepare the first request/response line
-	 */
-	len = 0;
-	if (data->req)
-		len = sprintf(buf, "%s %s HTTP/1.%s\r\n", data->method, data->url, data->http);
-	else if (!data->skip_http)
-		len = sprintf(buf, "HTTP/1.%s %03d %s\r\n", data->http, data->code, data->msg);
-
-	/*
-	 * Now add all headers.
-	 */
-	t = data->headers;
-	while (t) {
-		len += sprintf(buf+len, "%s: %s\r\n", t->key, t->value);
-		t = t->next;
-	}
-
-	/*
-	 * Terminate headers
-	 */
-	strcat(buf, "\r\n");
-
-	/*
-	 * Flush it all down the toilet
-	 */
-	if (!so_closed(fd))
-		i = write(fd, buf, len+2);
-	else
-		i = -999;
-
-	free(buf);
-
-	if (i <= 0 || i != len+2) {
-		if (debug)
-			printf("headers_send: fd %d warning %d (connection closed)\n", fd, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Connection cleanup - discard "size" of incomming data.
- */
-int data_drop(int src, int size) {
-	char *buf;
-	int i, block, c = 0;
-
-	if (!size)
-		return 1;
-
-	buf = new(BLOCK);
-	do {
-		block = (size-c > BLOCK ? BLOCK : size-c);
-		i = read(src, buf, block);
-		c += i;
-	} while (i > 0 && c < size);
-
-	free(buf);
-	if (i <= 0) {
-		if (debug)
-			printf("data_drop: fd %d warning %d (connection closed)\n", src, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Forward "size" of data from "src" to "dst". If size == -1 then keep
- * forwarding until src reaches EOF.
- */
-int data_send(int dst, int src, int size) {
-	char *buf;
-	int i, block;
-	int c = 0;
-	int j = 1;
-
-	if (!size)
-		return 1;
-
-	buf = new(BLOCK);
-
-	do {
-		block = (size == -1 || size-c > BLOCK ? BLOCK : size-c);
-		i = read(src, buf, block);
-		
-		if (i > 0)
-			c += i;
-
-		if (debug)
-			printf("data_send: read %d of %d / %d of %d (errno = %s)\n", i, block, c, size, i < 0 ? strerror(errno) : "ok");
-
-		if (so_closed(dst)) {
-			i = -999;
-			break;
-		}
-
-		if (i > 0) {
-			j = write(dst, buf, i);
-
-			if (debug)
-				printf("data_send: wrote %d of %d\n", j, i);
-		}
-
-	} while (i > 0 && j > 0 && (size == -1 || c <  size));
-
-	free(buf);
-
-	if (i <= 0 || j <= 0) {
-		if (i == 0 && j > 0 && (size == -1 || c == size))
-			return 1;
-
-		if (debug)
-			printf("data_send: fds %d:%d warning %d (connection closed)\n", dst, src, i);
-		return 0;
-	}
-
-	return 1;
-}
-
-/*
- * Forward chunked HTTP body from "src" descriptor to "dst".
- */
-int chunked_data_send(int dst, int src) {
-	char *buf;
-	int bsize;
-	int i, csize;
-
-	char *err = NULL;
-
-	bsize = BUFSIZE;
-	buf = new(bsize);
-
-	/* Take care of all chunks */
-	do {
-		i = so_recvln(src, &buf, &bsize);
-		if (i <= 0) {
-			if (debug)
-				printf("chunked_data_send: aborting, read error\n");
-			free(buf);
-			return 0;
-		}
-
-		if (debug)
-			printf("Line: %s", buf);
-
-		/*
-		printf("*buf = ");
-		for (i = 0; i < 100; i++) {
-			printf("%02x ", buf[i]);
-			if (i % 8 == 7)
-				printf("\n       ");
-		}
-		printf("\n");
-		*/
-
-		csize = strtol(buf, &err, 16);
-
-		if (debug)
-			printf("strtol: %d (%x) - err: %s\n", csize, csize, err);
-
-		if (*err != '\r' && *err != '\n' && *err != ';' && *err != ' ' && *err != '\t') {
-			if (debug)
-				printf("chunked_data_send: aborting, chunk size format error\n");
-			free(buf);
-			return 0;
-		}
-
-		if (debug && !csize)
-			printf("last chunk: %d\n", csize);
-
-		write(dst, buf, strlen(buf));
-		if (csize)
-			if (!data_send(dst, src, csize+2)) {
-				if (debug)
-					printf("chunked_data_send: aborting, data_send failed\n");
-
-				free(buf);
-				return 0;
-			}
-
-	} while (csize != 0);
-
-	/* Take care of possible trailer */
-	do {
-		i = so_recvln(src, &buf, &bsize);
-		if (debug)
-			printf("Trailer header(i=%d): %s\n", i, buf);
-		if (i > 0)
-			write(dst, buf, strlen(buf));
-	} while (i > 0 && buf[0] != '\r' && buf[0] != '\n');
-
-	free(buf);
-	return 1;
-}
-
-/*
- * Full-duplex forwarding between proxy and client descriptors.
- * Used for bidirectional HTTP CONNECT connection.
- */
-int tunnel(int cd, int sd) {
-	struct timeval timeout;
-	fd_set set;
-	int i, to, ret, sel;
-	char *buf;
-
-	buf = new(BUFSIZE);
-
-	if (debug)
-		printf("tunnel: select cli: %d, srv: %d\n", cd, sd);
-
-	do {
-		FD_ZERO(&set);
-		FD_SET(cd, &set);
-		FD_SET(sd, &set);
-
-		ret = 1;
-		timeout.tv_sec = 1;
-		timeout.tv_usec = 0;
-
-		sel = select(FD_SETSIZE, &set, NULL, NULL, &timeout);
-		if (sel > 0) {
-			if (FD_ISSET(cd, &set)) {
-				i = cd;
-				to = sd;
-			} else {
-				i = sd;
-				to = cd;
-			}
-
-			ret = read(i, buf, BUFSIZE);
-			if (so_closed(to)) {
-				free(buf);
-				return 0;
-			}
-
-			if (ret > 0);
-				write(to, buf, ret);
-
-		} else if (sel < 0) {
-			free(buf);
-			return 0;
-		}
-	} while (ret > 0);
-
-	free(buf);
-	return 1;
-}
-
-/*
  * Duplicate client request headers, change requested method to HEAD
  * (so we avoid any body transfers during NTLM negotiation), and add
  * proxy authentication request headers.
@@ -763,36 +387,38 @@ int tunnel(int cd, int sd) {
  * NTLM auth message and insert it into the original client header,
  * which is then processed by caller himself.
  *
- * If the immediate reply is an error message, it get stored into
- * error if not NULL, so it can be forwarded to the client. Caller
- * must then free it!
+ * If the proxy closes the connection for some reason, we notify our
+ * caller by setting closed to 1. Otherwise, it is set to 0.
+ * If closed == NULL, we do not signal anything.
  */
-int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *passnt, char *passlm, char *domain, int silent) {
+int authenticate(int sd, rr_data_t request, struct auth_s *creds, int *closed) {
 	char *tmp, *buf, *challenge;
 	rr_data_t auth;
 	int len, rc;
 
+	if (closed)
+		*closed = 0;
+
 	buf = new(BUFSIZE);
 
 	strcpy(buf, "NTLM ");
-	len = ntlm_request(&tmp, workstation, domain, hashntlm2, hashnt, hashlm, flags);
+	len = ntlm_request(&tmp, creds);
 	to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
 	free(tmp);
 	
-	auth = dup_rr_data(data);
+	auth = dup_rr_data(request);
 
 	/*
-	 * If the request is CONNECT, we keep it unmodified as there are no possible data
-	 * transfers until auth is fully negotiated. All other requests are changed to HEAD.
+	 * If the request is CONNECT, we have to keep it unmodified
 	 */
-	if (!CONNECT(data)) {
+	if (!CONNECT(request)) {
 		free(auth->method);
 		auth->method = strdup("GET");
 	}
 	auth->headers = hlist_mod(auth->headers, "Proxy-Authorization", buf, 1);
 	auth->headers = hlist_del(auth->headers, "Content-Length");
 
-	if (debug && !silent) {
+	if (debug) {
 		printf("\nSending auth request...\n");
 		hlist_dump(auth->headers);
 	}
@@ -805,13 +431,17 @@ int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *pass
 	free_rr_data(auth);
 	auth = new_rr_data();
 
-	if (debug && !silent)
+	if (debug) {
 		printf("Reading auth response...\n");
+	}
 
 	if (!headers_recv(sd, auth)) {
 		rc = 0;
 		goto bailout;
 	}
+
+	if (debug)
+		hlist_dump(auth->headers);
 
 	tmp = hlist_get(auth->headers, "Content-Length");
 	if (tmp && (len = atoi(tmp))) {
@@ -820,17 +450,20 @@ int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *pass
 		data_drop(sd, len);
 	}
 
+	/*
+	 * Should auth continue?
+	 */
 	if (auth->code == 407) {
 		tmp = hlist_get(auth->headers, "Proxy-Authenticate");
 		if (tmp) {
 			challenge = new(strlen(tmp));
 			len = from_base64(challenge, tmp+5);
 			if (len > NTLM_CHALLENGE_MIN) {
-				len = ntlm_response(&tmp, challenge, len, user, passntlm2, passnt, passlm, workstation, domain, hashntlm2, hashnt, hashlm);
+				len = ntlm_response(&tmp, challenge, len, creds);
 				if (len > 0) {
 					strcpy(buf, "NTLM ");
 					to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
-					data->headers = hlist_mod(data->headers, "Proxy-Authorization", buf, 1);
+					request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
 					free(tmp);
 				} else {
 					syslog(LOG_ERR, "No target info block. Cannot do NTLMv2!\n");
@@ -847,17 +480,35 @@ int authenticate(int sd, rr_data_t data, char *user, char *passntlm2, char *pass
 
 			free(challenge);
 		} else {
-			if (debug)
-				hlist_dump(auth->headers);
 			syslog(LOG_WARNING, "No Proxy-Authenticate received! NTLM not supported?\n");
 		}
 	} else if (auth->code >= 500 && auth->code <= 599) {
+		/*
+		 * Proxy didn't like the request, close connection and don't try again.
+		 */
 		syslog(LOG_WARNING, "The request was denied!\n");
 
 		close(sd);
 		rc = 500;
 
 		goto bailout;
+	} else {
+		/*
+		 * No auth was neccessary, let the caller make the request again.
+		 */
+		if (closed)
+			*closed = 1;
+	}
+
+	/*
+	 * Does proxy intend to close the connection? E.g. it didn't require auth
+	 * at all or there was some problem. If so, let caller know that it should
+	 * reconnect!
+	 */
+	if (closed && hlist_subcmp(auth->headers, "Proxy-Connection", "close")) {
+		if (debug)
+			printf("Proxy signals it's closing the connection.\n");
+		*closed = 1;
 	}
 
 	rc = 1;
@@ -867,6 +518,91 @@ bailout:
 	free(buf);
 
 	return rc;
+}
+
+/*
+ * Auth connection "sd" and try to return negotiated CONNECT
+ * connection to a remote host:port (thost).
+ *
+ * Return 0 for success, -1 for proxy negotiation error and
+ * -HTTP_CODE in case the request failed.
+ */
+int make_connect(int sd, const char *thost) {
+	rr_data_t data1, data2;
+	int ret, closed;
+
+	if (!sd || !thost || !strlen(thost))
+		return -1;
+
+	data1 = new_rr_data();
+	data2 = new_rr_data();
+
+	data1->req = 1;
+	data1->method = strdup("CONNECT");
+	data1->url = strdup(thost);
+	data1->http = strdup("0");
+	data1->headers = hlist_mod(data1->headers, "Proxy-Connection", "Keep-Alive", 1);
+
+	if (debug)
+		printf("Starting authentication...\n");
+
+	ret = authenticate(sd, data1, creds, &closed);
+	if (ret && ret != 500) {
+		if (closed || so_closed(sd)) {
+			close(sd);
+			sd = proxy_connect();
+			if (sd <= 0) {
+				ret = -1;
+				goto bailout;
+			}
+		}
+
+		if (debug) {
+			printf("Sending real request:\n");
+			hlist_dump(data1->headers);
+		}
+
+		if (headers_send(sd, data1)) {
+			if (debug)
+				printf("Reading real response:\n");
+
+			if (headers_recv(sd, data2)) {
+				if (debug)
+					hlist_dump(data2->headers);
+				if (data2->code == 200) {
+					if (debug)
+						printf("Ok CONNECT response. Tunneling...\n");
+					ret = 0;
+					goto bailout;
+				} else if (data2->code == 407) {
+					syslog(LOG_ERR, "Authentication for tunnel %s failed!\n", thost);
+				} else {
+					syslog(LOG_ERR, "Request for CONNECT denied!\n");
+				}
+				ret = -data2->code;
+			} else { 
+				if (debug)
+					printf("Reading response failed!\n");
+				ret = -1;
+			}
+		} else {
+			if (debug)
+				printf("Sending request failed!\n");
+			ret = -1;
+		}
+	} else {
+		if (ret == 500)
+			syslog(LOG_ERR, "Tunneling to %s not allowed!\n", thost);
+		else
+			syslog(LOG_ERR, "Authentication requests failed!\n");
+		ret = -500;
+	}
+
+bailout:
+	free_rr_data(data1);
+	free_rr_data(data2);
+
+	return ret;
 }
 
 /*
@@ -881,7 +617,7 @@ int has_body(rr_data_t request, rr_data_t response) {
 	 * Checking complete req+res conversation or just the
 	 * first part when there's no response yet?
 	 */
-	current = (response->http != NULL ? response : request);
+	current = (response->http ? response : request);
 
 	/*
 	 * HTTP body length decisions. There MUST NOT be any body from 
@@ -960,12 +696,12 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
 
 	len = 0;
 	do {
-		size = read(*sd, buf + len, SAMPLE - len);
+		size = read(*sd, buf + len, SAMPLE - len - 1);
 		if (debug)
 			printf("scanner_hook: read %d of %d\n", size, SAMPLE - len);
 		if (size > 0)
 			len += size;
-	} while (size > 0 && len < SAMPLE);
+	} while (size > 0 && len < SAMPLE - 1);
 
 	if (strstr(buf, "<title>Downloading status</title>") && (pos=strstr(buf, "ISAServerUniqueID=")) && (pos = strchr(pos, '"'))) {
 		pos++;
@@ -1083,7 +819,7 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
 					nc = i;
 				} else {
 					nc = proxy_connect();
-					c = authenticate(nc, newreq, user, passntlm2, passnt, passlm, domain, 0);
+					c = authenticate(nc, newreq, creds, NULL);
 					if (c > 0 && c != 500) {
 						if (debug)
 							printf("scanner_hook: Authentication OK, getting the file...\n");
@@ -1172,13 +908,13 @@ int scanner_hook(rr_data_t *request, rr_data_t *response, int *cd, int *sd, long
  * back to client. We loop here to allow proxy keep-alive connections)
  * until the proxy closes.
  */
-void *process(void *client) {
+void *proxy_thread(void *client) {
 	int *rsocket[2], *wsocket[2];
-	int i, loop, bodylen, keep, chunked, plugin;
+	int i, loop, bodylen, keep, chunked, plugin, closed;
 	rr_data_t data[2], errdata;
 	hlist_t tl;
 	char *tmp, *buf, *pos, *dom;
-	char *puser, *ppassntlm2, *ppassnt, *ppasslm, *pdomain;		/* Per-thread credentials; for NTLM-to-basic */
+	struct auth_s *tcreds;						/* Per-thread credentials; for NTLM-to-basic */
 
 	int cd = (int)client;
 	int authok = 0;
@@ -1202,21 +938,10 @@ void *process(void *client) {
 	if (!sd)
 		sd = proxy_connect();
 
-	puser = new(MINIBUF_SIZE);
-	ppassntlm2 = new(MINIBUF_SIZE);
-	ppassnt = new(MINIBUF_SIZE);
-	ppasslm = new(MINIBUF_SIZE);
-	pdomain = new(MINIBUF_SIZE);
-
-	strlcpy(pdomain, domain, MINIBUF_SIZE);
 	if (!ntlmbasic) {
-		strlcpy(puser, user, MINIBUF_SIZE);
-		if (passntlm2)
-			memcpy(ppassntlm2, passntlm2, 16);
-		if (passnt)
-			memcpy(ppassnt, passnt, 21);
-		if (passlm)
-			memcpy(ppasslm, passlm, 21);
+		tcreds = dup_auth(creds, 1);
+	} else {
+		tcreds = dup_auth(creds, 0);
 	}
 
 	if (sd <= 0)
@@ -1246,6 +971,7 @@ void *process(void *client) {
 				printf("\n******* Round %d C: %d, S: %d *******!\n", loop+1, cd, sd);
 				printf("Reading headers...\n");
 			}
+
 			if (!headers_recv(*rsocket[loop], data[loop])) {
 				close(sd);
 				free_rr_data(data[0]);
@@ -1300,32 +1026,32 @@ void *process(void *client) {
 				} else {
 					dom = strchr(buf, '\\');
 					if (dom == NULL) {
-						strlcpy(puser, buf, MIN(MINIBUF_SIZE, pos-buf+1));
+						auth_strncpy(tcreds, user, buf, MIN(MINIBUF_SIZE, pos-buf+1));
 					} else {
-						strlcpy(pdomain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
-						strlcpy(puser, dom+1, MIN(MINIBUF_SIZE, pos-dom));
+						auth_strncpy(tcreds, domain, buf, MIN(MINIBUF_SIZE, dom-buf+1));
+						auth_strncpy(tcreds, user, dom+1, MIN(MINIBUF_SIZE, pos-dom));
 					}
 
-					if (hashntlm2) {
-						tmp = ntlm2_hash_password(puser, pdomain, pos+1);
-						memcpy(ppassntlm2, tmp, 16);
+					if (tcreds->hashntlm2) {
+						tmp = ntlm2_hash_password(tcreds->user, tcreds->domain, pos+1);
+						auth_memcpy(tcreds, passntlm2, tmp, 16);
 						free(tmp);
 					}
 
-					if (hashnt) {
+					if (tcreds->hashnt) {
 						tmp = ntlm_hash_nt_password(pos+1);
-						memcpy(ppassnt, tmp, 21);
+						auth_memcpy(tcreds, passnt, tmp, 21);
 						free(tmp);
 					}
 
-					if (hashlm) {
+					if (tcreds->hashlm) {
 						tmp = ntlm_hash_lm_password(pos+1);
-						memcpy(ppasslm, tmp, 21);
+						auth_memcpy(tcreds, passlm, tmp, 21);
 						free(tmp);
 					}
 
 					if (debug) {
-						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", pdomain, puser, workstation);
+						printf("NTLM-to-basic: Credentials parsed: %s\\%s at %s\n", tcreds->domain, tcreds->user, tcreds->workstation);
 					}
 
 					memset(buf, 0, strlen(buf));
@@ -1391,12 +1117,12 @@ void *process(void *client) {
 			 */
 			if (!loop && data[0]->req && !authok) {
 				errdata = NULL;
-				if (!(i = authenticate(*wsocket[0], data[0], puser, ppassntlm2, ppassnt, ppasslm, pdomain, 0)))
+				if (!(i = authenticate(*wsocket[0], data[0], tcreds, &closed)))
 					syslog(LOG_ERR, "Authentication requests failed. Will try without.\n");
 
-				if (!i || so_closed(sd)) {
+				if (!i || closed || so_closed(sd)) {
 					if (debug)
-						printf("Proxy closed connection. Reconnecting...\n");
+						printf("Proxy closed connection (i=%d, closed=%d, so_closed=%d). Reconnecting...\n", i, closed, so_closed(sd));
 					close(sd);
 					sd = proxy_connect();
 					if (sd <= 0) {
@@ -1541,11 +1267,7 @@ void *process(void *client) {
 	} while (!so_closed(sd) && !so_closed(cd) && !serialize && (keep || so_dataready(cd)));
 
 bailout:
-	free(puser);
-	free(ppassntlm2);
-	free(ppassnt);
-	free(ppasslm);
-	free(pdomain);
+	free_auth(tcreds);
 
 	if (debug)
 		printf("\nThread finished.\n");
@@ -1561,7 +1283,7 @@ bailout:
 		close(sd);
 
 	/*
-	 * Add ourself to the "threads to join" list.
+	 * Add ourselves to the "threads to join" list.
 	 */
 	if (!serialize) {
 		pthread_mutex_lock(&threads_mtx);
@@ -1573,14 +1295,14 @@ bailout:
 }
 
 void *precache_thread(void *data) {
-	int i, sd;
+	int i, sd, closed;
 	rr_data_t data1, data2;
 	char *tmp;
 	int new = 0;
 
 	while (!quit) {
-		if (plist_count(connection_list) < precache) {
-			printf("precache_thread: creating new connection\n");
+		if (plist_count(connection_list) < precache && check_active() < 1) {
+			printf("precache_thread: creating new connection (active: %d)\n", active_conns);
 			sd = proxy_connect();
 
 			data1 = new_rr_data();
@@ -1591,8 +1313,8 @@ void *precache_thread(void *data) {
 			data1->url = strdup("http://www.google.com/");
 			data1->http = strdup("1");
 
-			i = authenticate(sd, data1, user, passntlm2, passnt, passlm, domain, 1);
-			if (i && i == 1 && !so_closed(sd) && headers_send(sd, data1) && headers_recv(sd, data2) && data2->code == 302) {
+			i = authenticate(sd, data1, creds, &closed);
+			if (i && i == 1 && !closed && !so_closed(sd) && headers_send(sd, data1) && headers_recv(sd, data2) && data2->code == 302) {
 				tmp = hlist_get(data2->headers, "Content-Length");
 				if (tmp)
 					data_drop(sd, atoi(tmp));
@@ -1607,9 +1329,12 @@ void *precache_thread(void *data) {
 				sleep(60);
 			}
 		} else {
-			if (debug && new > 0) {
-				printf("precache_thread: connection cache full (%d), resting\n", plist_count(connection_list));
+			printf("SLEEPING\n");
+			sleep(4);
+			if (active_conns > 0) {
 				new = 0;
+				printf("*************************************************************************\n");
+				printf("precache_thread: connection cache full (%d), resting (active: %d)\n", plist_count(connection_list), active_conns);
 			}
 			sched_yield();
 		}
@@ -1628,11 +1353,10 @@ void *precache_thread(void *data) {
  * "corkscrew" which after all require us for authentication and tunneling
  *  their HTTP CONNECT in the end.
  */
-void *autotunnel(void *client) {
-	rr_data_t data1, data2;
-	int i, sd;
+void *tunnel_thread(void *client) {
 	int cd = ((struct thread_arg_s *)client)->fd;
 	char *thost = ((struct thread_arg_s *)client)->target;
+	int sd;
 
 	sd = proxy_connect();
 	free(client);
@@ -1645,63 +1369,12 @@ void *autotunnel(void *client) {
 	if (debug)
 		printf("Tunneling to %s for client %d...\n", thost, cd);
 
-	data1 = new_rr_data();
-	data2 = new_rr_data();
+	if (!make_connect(sd, thost)) {
+		tunnel(cd, sd);
+	}
 
-	data1->req = 1;
-	data1->method = strdup("CONNECT");
-	data1->url = strdup(thost);
-	data1->http = strdup("0");
-
-	if (debug)
-		printf("Starting authentication...\n");
-
-	i = authenticate(sd, data1, user, passntlm2, passnt, passlm, domain, 0);
-	if (i && i != 500) {
-		if (so_closed(sd)) {
-			close(sd);
-			sd = proxy_connect();
-			if (sd <= 0) 
-				goto bailout;
-		}
-
-		if (debug) {
-			printf("Sending real request:\n");
-			hlist_dump(data1->headers);
-		}
-
-		if (headers_send(sd, data1)) {
-			if (debug)
-				printf("Reading real response:\n");
-
-			if (headers_recv(sd, data2)) {
-				if (debug)
-					hlist_dump(data2->headers);
-
-				if (data2->code == 200) {
-					if (debug)
-						printf("Ok CONNECT response. Tunneling...\n");
-
-					tunnel(cd, sd);
-				} else if (data2->code == 407) {
-					syslog(LOG_ERR, "Authentication for tunnel %s failed!\n", thost);
-				} else if (debug)
-					syslog(LOG_ERR, "Request for CONNECT denied!\n");
-			} else if (debug)
-				printf("Reading response failed!\n");
-		} else if (debug)
-			printf("Sending request failed!\n");
-	} else if (i == 500)
-		syslog(LOG_ERR, "Tunneling to %s not allowed!\n", thost);
-	else
-		syslog(LOG_ERR, "Authentication requests failed!\n");
-
-bailout:
 	close(sd);
 	close(cd);
-
-	free_rr_data(data1);
-	free_rr_data(data2);
 
 	/*
 	 * Add ourself to the "threads to join" list.
@@ -1713,10 +1386,243 @@ bailout:
 	return NULL;
 }
 
+void *socks5_thread(void *client) {
+	int cd = (int)client;
+	char *tmp, *thost, *tport, *uname, *upass;
+	unsigned char *bs, *auths, *addr;
+	unsigned short port;
+	int ver, r, c, i;
+
+	int found = -1;
+	int sd = 0;
+	int open = !hlist_count(users_list);
+
+	/*
+	 * Check client's version, possibly fuck'em
+	 */
+	bs = (unsigned char *)new(10);
+	thost = new(MINIBUF_SIZE);
+	tport = new(MINIBUF_SIZE);
+	r = read(cd, bs, 2);
+	if (r != 2 || bs[0] != 5)
+		goto bail1;
+
+	/*
+	 * Read offered auth schemes
+	 */
+	c = bs[1];
+	auths = (unsigned char *)new(c+1);
+	r = read(cd, auths, c);
+	if (r != c)
+		goto bail2;
+
+	/*
+	 * Are we wide open and client is OK with no auth?
+	 */
+	if (open) {
+		for (i = 0; i < c && (auths[i] || (found = 0)); ++i);
+	}
+
+	/*
+	 * If not, accept plain auth if offered
+	 */
+	if (found < 0) {
+		for (i = 0; i < c && (auths[i] != 2 || !(found = 2)); ++i);
+	}
+
+	/*
+	 * If not open and no auth offered or open and auth requested, fuck'em
+	 * and complete the handshake
+	 */
+	if (found < 0) {
+		bs[0] = 5;
+		bs[1] = 0xFF;
+		write(cd, bs, 2);
+		goto bail2;
+	} else {
+		bs[0] = 5;
+		bs[1] = found;
+		write(cd, bs, 2);
+	}
+
+	/*
+	 * Plain auth negotiated?
+	 */
+	if (found != 0) {
+		/*
+		 * Check ver and read username len
+		 */
+		r = read(cd, bs, 2);
+		if (r != 2) {
+			bs[0] = 1;
+			bs[1] = 0xFF;		/* Unsuccessful (not supported) */
+			write(cd, bs, 2);
+			goto bail2;
+		}
+		c = bs[1];
+
+		/*
+		 * Read username and pass len
+		 */
+		uname = new(c+1);
+		r = read(cd, uname, c+1);
+		if (r != c+1) {
+			free(uname);
+			goto bail2;
+		}
+		i = uname[c];
+		uname[c] = 0;
+		c = i;
+
+		/*
+		 * Read pass
+		 */
+		upass = new(c+1);
+		r = read(cd, upass, c);
+		if (r != c) {
+			free(upass);
+			free(uname);
+			goto bail2;
+		}
+		upass[c] = 0;
+
+		/*
+		 * Check credentials against the list
+		 */
+		tmp = hlist_get(users_list, uname);
+		if (!hlist_count(users_list) || (tmp && !strcmp(tmp, upass))) {
+			bs[0] = 1;
+			bs[1] = 0;		/* Success */
+		} else {
+			bs[0] = 1;
+			bs[1] = 0xFF;		/* Failed */
+		}
+
+		/*
+		 * Send response
+		 */
+		write(cd, bs, 2);
+		free(upass);
+		free(uname);
+
+		/*
+		 * Fuck'em if auth failed
+		 */
+		if (bs[1])
+			goto bail2;
+	}
+
+	/*
+	 * Read request type
+	 */
+	r = read(cd, bs, 4);
+	if (r != 4)
+		goto bail2;
+
+	/*
+	 * Is it connect for supported address type (IPv4 or DNS)? If not, fuck'em
+	 */
+	if (bs[1] != 1 || (bs[3] != 1 && bs[3] != 3)) {
+		bs[0] = 5;
+		bs[1] = 2;			/* Not allowed */
+		bs[2] = 0;
+		bs[3] = 1;			/* Dummy IPv4 */
+		memset(bs+4, 0, 6);
+		write(cd, bs, 10);
+		goto bail2;
+	}
+
+	/*
+	 * Ok, it's connect to a domain or IP
+	 * Let's read dest address
+	 */
+	if (bs[3] == 1) {
+		ver = 1;			/* IPv4, we know the length */
+		c = 4;
+	} else if (bs[3] == 3) {
+		ver = 2;			/* FQDN, get string length */
+		r = read(cd, &c, 1);
+		if (r != 1)
+			goto bail2;
+	} else
+		goto bail2;
+
+	addr = (unsigned char *)new(c+10 + 1);
+	r = read(cd, addr, c);
+	if (r != c)
+		goto bail3;
+	addr[c] = 0;
+
+	/*
+	 * Convert the address to character string
+	 */
+	if (ver == 1) {
+		sprintf(thost, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);	/* It's in network byte order */
+	} else {
+		strlcpy(thost, (char *)addr, MINIBUF_SIZE);
+	}
+
+	/*
+	 * Read port number and convert to host byte order int
+	 */
+	r = read(cd, &port, 2);
+	if (r != 2)
+		goto bail3;
+	sprintf(tport, "%d", ntohs(port));
+	strlcat(thost, ":", MINIBUF_SIZE);
+	strlcat(thost, tport, MINIBUF_SIZE);
+
+	/*
+	 * Try connect to parent proxy
+	 */
+	sd = proxy_connect();
+	if (sd <= 0 || (i=make_connect(sd, thost))) {
+		/*
+		 * No such luck, report failure
+		 */
+		bs[0] = 5;
+		bs[1] = 1;			/* General failure */
+		bs[2] = 0;
+		bs[3] = 1;			/* Dummy IPv4 */
+		memset(bs+4, 0, 6);
+		write(cd, bs, 10);
+		goto bail3;
+	} else {
+		/*
+		 * Proxy ok, auth worked
+		 */
+		bs[0] = 5;
+		bs[1] = 0;			/* Success */
+		bs[2] = 0;
+		bs[3] = 1;			/* Dummy IPv4 */
+		memset(bs+4, 0, 6);
+		write(cd, bs, 10);
+	}
+
+	/*
+	 * Let's give them bi-directional connection they asked for
+	 */
+	tunnel(cd, sd);
+
+bail3:
+	free(addr);
+bail2:
+	free(auths);
+bail1:
+	free(thost);
+	free(tport);
+	free(bs);
+	close(cd);
+	if (sd)
+		close(sd);
+
+	return NULL;
+}
+
 #define MAGIC_TESTS	11
 
 void magic_auth_detect(const char *url) {
-	int i, nc, c, found = -1;
+	int i, nc, c, closed, found = -1;
 	rr_data_t req, res;
 	char *tmp, *pos, *host = NULL;
 
@@ -1738,7 +1644,7 @@ void magic_auth_detect(const char *url) {
 
 	debug = 0;
 
-	if (!passnt || !passlm || !passntlm2) {
+	if (!creds->passnt || !creds->passlm || !creds->passntlm2) {
 		printf("Cannot detect NTLM dialect - password or its hashes must be defined, try -I\n");
 		exit(1);
 	}
@@ -1764,10 +1670,10 @@ void magic_auth_detect(const char *url) {
 		if (host)
 			req->headers = hlist_add(req->headers, "Host", host, 1, 1);
 
-		hashnt = prefs[i][0];
-		hashlm = prefs[i][1];
-		hashntlm2 = prefs[i][2];
-		flags = prefs[i][3];
+		creds->hashnt = prefs[i][0];
+		creds->hashlm = prefs[i][1];
+		creds->hashntlm2 = prefs[i][2];
+		creds->flags = prefs[i][3];
 
 		printf("Config profile %2d/%d... ", i+1, MAGIC_TESTS);
 
@@ -1782,8 +1688,8 @@ void magic_auth_detect(const char *url) {
 			return;
 		}
 
-		c = authenticate(nc, req, user, passntlm2, passnt, passlm, domain, 0);
-		if (c <= 0 || c == 500) {
+		c = authenticate(nc, req, creds, &closed);
+		if (c <= 0 || c == 500 || closed) {
 			printf("Auth request ignored (HTTP code: %d)\n", c);
 			free_rr_data(res);
 			free_rr_data(req);
@@ -1822,15 +1728,15 @@ void magic_auth_detect(const char *url) {
 		if (prefs[found][3])
 			printf("Flags           0x%x\n", prefs[found][3]);
 		if (prefs[found][0]) {
-			printf("PassNT          %s\n", tmp=printmem(passnt, 16, 8));
+			printf("PassNT          %s\n", tmp=printmem(creds->passnt, 16, 8));
 			free(tmp);
 		}
 		if (prefs[found][1]) {
-			printf("PassLM          %s\n", tmp=printmem(passlm, 16, 8));
+			printf("PassLM          %s\n", tmp=printmem(creds->passlm, 16, 8));
 			free(tmp);
 		}
 		if (prefs[found][2]) {
-			printf("PassNTLMv2      %s\n", tmp=printmem(passntlm2, 16, 8));
+			printf("PassNTLMv2      %s\n", tmp=printmem(creds->passntlm2, 16, 8));
 			free(tmp);
 		}
 		printf("------------------------------------------------\n");
@@ -1851,8 +1757,8 @@ void carp(const char *msg, int console) {
 }
 
 int main(int argc, char **argv) {
-	char *tmp, *head, *uid, *pidfile, *auth;
-	char *password, *cpassntlm2, *cpassnt, *cpasslm;
+	char *tmp, *head;
+	char *cpassword, *cpassntlm2, *cpassnt, *cpasslm, *cuser, *cdomain, *cworkstation, *cuid, *cpidfile, *cauth;
 	struct passwd *pw;
 	struct termios termold, termnew;
 	pthread_attr_t pattr;
@@ -1870,22 +1776,25 @@ int main(int argc, char **argv) {
 	int interactivepwd = 0;
 	int interactivehash = 0;
 	int tracefile = 0;
+	int cflags = 0;
 	plist_t tunneld_list = NULL;
 	plist_t proxyd_list = NULL;
+	plist_t socksd_list = NULL;
 	plist_t rules = NULL;
 	config_t cf = NULL;
 	char *magic_detect = NULL;
 
-	user = new(MINIBUF_SIZE);
-	domain = new(MINIBUF_SIZE);
-	password = new(MINIBUF_SIZE);
+	creds = new_auth();
+	cuser = new(MINIBUF_SIZE);
+	cdomain = new(MINIBUF_SIZE);
+	cpassword = new(MINIBUF_SIZE);
 	cpassntlm2 = new(MINIBUF_SIZE);
 	cpassnt = new(MINIBUF_SIZE);
 	cpasslm = new(MINIBUF_SIZE);
-	workstation = new(MINIBUF_SIZE);
-	pidfile = new(MINIBUF_SIZE);
-	uid = new(MINIBUF_SIZE);
-	auth = new(MINIBUF_SIZE);
+	cworkstation = new(MINIBUF_SIZE);
+	cpidfile = new(MINIBUF_SIZE);
+	cuid = new(MINIBUF_SIZE);
+	cauth = new(MINIBUF_SIZE);
 
 	openlog("cntlm", LOG_CONS, LOG_DAEMON);
 
@@ -1895,7 +1804,7 @@ int main(int argc, char **argv) {
 	syslog(LOG_INFO, "Starting cntlm version " VERSION " for LITTLE endian\n");
 #endif
 
-	while ((i = getopt(argc, argv, ":-:a:c:d:fghIl:p:r:su:vw:A:BD:F:G:HL:M:P:S:T:U:")) != -1) {
+	while ((i = getopt(argc, argv, ":-:a:c:d:fghIl:p:r:su:vw:A:BD:F:G:HL:M:O:P:R:S:T:U:")) != -1) {
 		switch (i) {
 			case 'A':
 			case 'D':
@@ -1903,7 +1812,7 @@ int main(int argc, char **argv) {
 					myexit(1);
 				break;
 			case 'a':
-				strlcpy(auth, optarg, MINIBUF_SIZE);
+				strlcpy(cauth, optarg, MINIBUF_SIZE);
 				break;
 			case 'B':
 				ntlmbasic = 1;
@@ -1915,10 +1824,10 @@ int main(int argc, char **argv) {
 				}
 				break;
 			case 'd':
-				strlcpy(domain, optarg, MINIBUF_SIZE);
+				strlcpy(cdomain, optarg, MINIBUF_SIZE);
 				break;
 			case 'F':
-				flags = swap32(strtoul(optarg, &tmp, 0));
+				cflags = swap32(strtoul(optarg, &tmp, 0));
 				break;
 			case 'f':
 				asdaemon = 0;
@@ -1954,22 +1863,35 @@ int main(int argc, char **argv) {
 				/*
 				 * Create a listening socket for proxy function.
 				 */
-				listen_add(&proxyd_list, optarg, gateway);
+				listen_add("Proxy", &proxyd_list, optarg, gateway);
 				break;
 			case 'M':
 				magic_detect = strdup(optarg);
 				break;
+			case 'O':
+				listen_add("SOCKS5 proxy", &socksd_list, optarg, gateway);
+				break;
 			case 'P':
-				strlcpy(pidfile, optarg, MINIBUF_SIZE);
+				strlcpy(cpidfile, optarg, MINIBUF_SIZE);
 				break;
 			case 'p':
 				/*
 				 * Overwrite the password parameter with '*'s to make it
 				 * invisible in "ps", /proc, etc.
 				 */
-				strlcpy(password, optarg, MINIBUF_SIZE);
+				strlcpy(cpassword, optarg, MINIBUF_SIZE);
 				for (i = strlen(optarg)-1; i >= 0; --i)
 					optarg[i] = '*';
+				break;
+			case 'R':
+				tmp = strdup(optarg);
+				head = strchr(tmp, ':');
+				if (!head) {
+					fprintf(stderr, "Invalid username:password format for -R: %s\n", tmp);
+				} else {
+					head[0] = 0;
+					users_list = hlist_add(users_list, tmp, head+1, 1, 1);
+				}
 				break;
 			case 'r':
 				if (head_ok(optarg))
@@ -2005,15 +1927,15 @@ int main(int argc, char **argv) {
 				}
 				break;
 			case 'U':
-				strlcpy(uid, optarg, MINIBUF_SIZE);
+				strlcpy(cuid, optarg, MINIBUF_SIZE);
 				break;
 			case 'u':
 				i = strcspn(optarg, "@");
 				if (i != strlen(optarg)) {
-					strlcpy(user, optarg, MIN(MINIBUF_SIZE, i+1));
-					strlcpy(domain, optarg+i+1, MINIBUF_SIZE);
+					strlcpy(cuser, optarg, MIN(MINIBUF_SIZE, i+1));
+					strlcpy(cdomain, optarg+i+1, MINIBUF_SIZE);
 				} else {
-					strlcpy(user, optarg, MINIBUF_SIZE);
+					strlcpy(cuser, optarg, MINIBUF_SIZE);
 				}
 				break;
 			case 'v':
@@ -2022,7 +1944,7 @@ int main(int argc, char **argv) {
 				openlog("cntlm", LOG_CONS | LOG_PERROR, LOG_DAEMON);
 				break;
 			case 'w':
-				strlcpy(workstation, optarg, MINIBUF_SIZE);
+				strlcpy(cworkstation, optarg, MINIBUF_SIZE);
 				break;
 			case 'h':
 			default:
@@ -2071,6 +1993,8 @@ int main(int argc, char **argv) {
 				"\t    Main listening port for the NTLM proxy.\n");
 		fprintf(stderr, "\t-M  <testurl>\n"
 				"\t    Magic autodetection of proxy's NTLM dialect.\n");
+		fprintf(stderr, "\t-O  [<saddr>:]<lport>\n"
+				"\t    Enable SOCKS5 proxy and make it listen on the specified port (and address).\n");
 		fprintf(stderr, "\t-P  <pidfile>\n"
 				"\t    Create a PID file upon successful start.\n");
 		fprintf(stderr, "\t-p  <password>\n"
@@ -2162,7 +2086,15 @@ int main(int argc, char **argv) {
 		 * Bind the rest of proxy service ports.
 		 */
 		while ((tmp = config_pop(cf, "Listen"))) {
-			listen_add(&proxyd_list, tmp, gateway);
+			listen_add("Proxy", &proxyd_list, tmp, gateway);
+			free(tmp);
+		}
+
+		/*
+		 * Bind the rest of SOCKS5 service ports.
+		 */
+		while ((tmp = config_pop(cf, "SOCKS5Proxy"))) {
+			listen_add("SOCKS5 proxy", &socksd_list, tmp, gateway);
 			free(tmp);
 		}
 
@@ -2211,19 +2143,19 @@ int main(int argc, char **argv) {
 		/*
 		 * Single options.
 		 */
-		CFG_DEFAULT(cf, "Auth", auth, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Domain", domain, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Password", password, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Auth", cauth, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Domain", cdomain, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Password", cpassword, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassNTLMv2", cpassntlm2, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassNT", cpassnt, MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "PassLM", cpasslm, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Username", user, MINIBUF_SIZE);
-		CFG_DEFAULT(cf, "Workstation", workstation, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Username", cuser, MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "Workstation", cworkstation, MINIBUF_SIZE);
 
 		tmp = new(MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "Flags", tmp, MINIBUF_SIZE);
-		if (!flags)
-			flags = swap32(strtoul(tmp, NULL, 0));
+		if (!cflags)
+			cflags = swap32(strtoul(tmp, NULL, 0));
 		free(tmp);
 
 		tmp = new(MINIBUF_SIZE);
@@ -2233,6 +2165,17 @@ int main(int argc, char **argv) {
 			scanner_plugin_maxsize = atoi(tmp);
 		}
 		free(tmp);
+
+		while ((tmp = config_pop(cf, "SOCKS5Users"))) {
+			head = strchr(tmp, ':');
+			if (!head) {
+				syslog(LOG_ERR, "Invalid username:password format for SOCKS5User: %s\n", tmp);
+			} else {
+				head[0] = 0;
+				users_list = hlist_add(users_list, tmp, head+1, 1, 1);
+			}
+		}
+					
 
 		/*
 		 * Add User-Agent matching patterns.
@@ -2267,10 +2210,10 @@ int main(int argc, char **argv) {
 
 	config_close(cf);
 
-	if (!ntlmbasic && !strlen(user))
+	if (!ntlmbasic && !strlen(cuser))
 		carp("Parent proxy account username missing.\n", interactivehash || interactivepwd || magic_detect);
 
-	if (!ntlmbasic && !strlen(domain))
+	if (!ntlmbasic && !strlen(cdomain))
 		carp("Parent proxy account domain missing.\n", interactivehash || interactivepwd || magic_detect);
 
 	if (!interactivehash && !parent_list)
@@ -2282,51 +2225,56 @@ int main(int argc, char **argv) {
 	/*
 	 * Set default value for the workstation. Hostname if possible.
 	 */
-	if (!strlen(workstation)) {
+	if (!strlen(cworkstation)) {
 #if config_gethostname == 1
-		gethostname(workstation, MINIBUF_SIZE);
+		gethostname(cworkstation, MINIBUF_SIZE);
 #endif
-		if (!strlen(workstation))
-			strlcpy(workstation, "cntlm", MINIBUF_SIZE);
+		if (!strlen(cworkstation))
+			strlcpy(cworkstation, "cntlm", MINIBUF_SIZE);
 
-		syslog(LOG_INFO, "Workstation name used: %s\n", workstation);
+		syslog(LOG_INFO, "Workstation name used: %s\n", cworkstation);
 	}
 
 	/*
 	 * Parse selected NTLM hash combination.
 	 */
-	if (strlen(auth)) {
-		if (!strcasecmp("ntlm", auth)) {
-			hashnt = 1;
-			hashlm = 1;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("nt", auth)) {
-			hashnt = 1;
-			hashlm = 0;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("lm", auth)) {
-			hashnt = 0;
-			hashlm = 1;
-			hashntlm2 = 0;
-		} else if (!strcasecmp("ntlmv2", auth)) {
-			hashnt = 0;
-			hashlm = 0;
-			hashntlm2 = 1;
-		} else if (!strcasecmp("ntlm2sr", auth)) {
-			hashnt = 2;
-			hashlm = 0;
-			hashntlm2 = 0;
+	if (strlen(cauth)) {
+		if (!strcasecmp("ntlm", cauth)) {
+			creds->hashnt = 1;
+			creds->hashlm = 1;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("nt", cauth)) {
+			creds->hashnt = 1;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("lm", cauth)) {
+			creds->hashnt = 0;
+			creds->hashlm = 1;
+			creds->hashntlm2 = 0;
+		} else if (!strcasecmp("ntlmv2", cauth)) {
+			creds->hashnt = 0;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 1;
+		} else if (!strcasecmp("ntlm2sr", cauth)) {
+			creds->hashnt = 2;
+			creds->hashlm = 0;
+			creds->hashntlm2 = 0;
 		} else {
 			syslog(LOG_ERR, "Unknown NTLM auth combination.\n");
 			myexit(1);
 		}
 	}
 
-	if (!magic_detect)
-		syslog(LOG_INFO, "Using following NTLM hashes: NTLMv2(%d) NT(%d) LM(%d)\n", hashntlm2, hashnt, hashlm);
+	if (socksd_list && !users_list)
+		syslog(LOG_WARNING, "SOCKS5 proxy will NOT require any authentication\n");
 
-	if (flags)
-		syslog(LOG_INFO, "Using manual NTLM flags: 0x%X\n", swap32(flags));
+	if (!magic_detect)
+		syslog(LOG_INFO, "Using following NTLM hashes: NTLMv2(%d) NT(%d) LM(%d)\n", creds->hashntlm2, creds->hashnt, creds->hashlm);
+
+	if (cflags) {
+		syslog(LOG_INFO, "Using manual NTLM flags: 0x%X\n", swap32(cflags));
+		creds->flags = cflags;
+	}
 
 	/*
 	 * Last chance to get password from the user
@@ -2337,10 +2285,10 @@ int main(int argc, char **argv) {
 		termnew = termold;
 		termnew.c_lflag &= ~(ISIG | ECHO);
 		tcsetattr(0, TCSADRAIN, &termnew);
-		fgets(password, MINIBUF_SIZE, stdin);
+		fgets(cpassword, MINIBUF_SIZE, stdin);
 		tcsetattr(0, TCSADRAIN, &termold);
-		i = strlen(password)-1;
-		trimr(password);
+		i = strlen(cpassword)-1;
+		trimr(cpassword);
 		printf("\n");
 	}
 
@@ -2351,44 +2299,66 @@ int main(int argc, char **argv) {
 	 * If plain password is present, calculate its NT and LM hashes 
 	 * and remove it from the memory.
 	 */
-	if (!strlen(password)) {
+	if (!strlen(cpassword)) {
 		if (strlen(cpassntlm2)) {
-			passntlm2 = scanmem(cpassntlm2, 8);
-			if (!passntlm2) {
+			tmp = scanmem(cpassntlm2, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassNTLMv2 hash, terminating\n");
 				exit(1);
 			}
-			passntlm2 = realloc(passntlm2, 21 + 1);
-			memset(passntlm2+16, 0, 5);
+			auth_memcpy(creds, passntlm2, tmp, 16);
+			memset(creds->passntlm2+16, 0, 5);
+			free(tmp);
 		}
 		if (strlen(cpassnt)) {
-			passnt = scanmem(cpassnt, 8);
-			if (!passnt) {
+			tmp = scanmem(cpassnt, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassNT hash, terminating\n");
 				exit(1);
 			}
-			passnt = realloc(passnt, 21 + 1);
-			memset(passnt+16, 0, 5);
+			auth_memcpy(creds, passnt, tmp, 16);
+			memset(creds->passnt+16, 0, 5);
+			free(tmp);
 		}
 		if (strlen(cpasslm)) {
-			passlm = scanmem(cpasslm, 8);
-			if (!passlm) {
+			tmp = scanmem(cpasslm, 8);
+			if (!tmp) {
 				syslog(LOG_ERR, "Invalid PassLM hash, terminating\n");
 				exit(1);
 			}
-			passlm = realloc(passlm, 21 + 1);
-			memset(passlm+16, 0, 5);
+			auth_memcpy(creds, passlm, tmp, 16);
+			memset(creds->passlm+16, 0, 5);
+			free(tmp);
 		}
 	} else {
-		if (hashnt || magic_detect || interactivehash)
-			passnt = ntlm_hash_nt_password(password);
-		if (hashlm || magic_detect || interactivehash)
-			passlm = ntlm_hash_lm_password(password);
-		if (hashntlm2 || magic_detect || interactivehash) {
-			passntlm2 = ntlm2_hash_password(user, domain, password);
+		if (creds->hashnt || magic_detect || interactivehash) {
+			tmp = ntlm_hash_nt_password(cpassword);
+			auth_memcpy(creds, passnt, tmp, 21);
+			free(tmp);
+		} if (creds->hashlm || magic_detect || interactivehash) {
+			tmp = ntlm_hash_lm_password(cpassword);
+			auth_memcpy(creds, passlm, tmp, 21);
+			free(tmp);
+		} if (creds->hashntlm2 || magic_detect || interactivehash) {
+			tmp = ntlm2_hash_password(cuser, cdomain, cpassword);
+			auth_memcpy(creds, passntlm2, tmp, 16);
+			free(tmp);
 		}
-		memset(password, 0, strlen(password));
+		memset(cpassword, 0, strlen(cpassword));
 	}
+
+	auth_strcpy(creds, user, cuser);
+	auth_strcpy(creds, domain, cdomain);
+	auth_strcpy(creds, workstation, cworkstation);
+
+	free(cuser);
+	free(cdomain);
+	free(cworkstation);
+	free(cpassword);
+	free(cpassntlm2);
+	free(cpassnt);
+	free(cpasslm);
+	free(cauth);
 
 	/*
 	 * Try known NTLM auth combinations and print which ones work.
@@ -2396,28 +2366,34 @@ int main(int argc, char **argv) {
 	 */
 	if (magic_detect) {
 		magic_auth_detect(magic_detect);
-		exit(0);
+		goto bailout;
 	}
 
 	if (interactivehash) {
-		tmp = printmem(passlm, 16, 8);
-		printf("PassLM          %s\n", tmp);
-		free(tmp);
-		tmp = printmem(passnt, 16, 8);
-		printf("PassNT          %s\n", tmp);
-		free(tmp);
-		if (passntlm2 && strlen(passntlm2)) {
-			tmp = printmem(passntlm2, 16, 8);
-			printf("PassNTLMv2      %s    # Only for user '%s', domain '%s'\n", tmp, user, domain);
+		if (creds->passlm) {
+			tmp = printmem(creds->passlm, 16, 8);
+			printf("PassLM          %s\n", tmp);
 			free(tmp);
 		}
-		exit(0);
+
+		if (creds->passnt) {
+			tmp = printmem(creds->passnt, 16, 8);
+			printf("PassNT          %s\n", tmp);
+			free(tmp);
+		}
+
+		if (creds->passntlm2) {
+			tmp = printmem(creds->passntlm2, 16, 8);
+			printf("PassNTLMv2      %s    # Only for user '%s', domain '%s'\n", tmp, creds->user, creds->domain);
+			free(tmp);
+		}
+		goto bailout;
 	}
 
 	/*
 	 * If we're going to need a password, check we really have it.
 	 */
-	if (!ntlmbasic && ((hashnt && !passnt) || (hashlm && !passlm) || (hashntlm2 && !passntlm2))) {
+	if (!ntlmbasic && ((creds->hashnt && !creds->passnt) || (creds->hashlm && !creds->passlm) || (creds->hashntlm2 && !creds->passntlm2))) {
 		syslog(LOG_ERR, "Parent proxy account password (or required hashes) missing.\n");
 		myexit(1);
 	}
@@ -2467,21 +2443,21 @@ int main(int argc, char **argv) {
 	/*
 	 * Check and change UID.
 	 */
-	if (strlen(uid)) {
+	if (strlen(cuid)) {
 		if (getuid() && geteuid()) {
 			syslog(LOG_WARNING, "No root privileges; keeping identity %d:%d\n", getuid(), getgid());
 		} else {
-			if (isdigit(uid[0])) {
-				nuid = atoi(uid);
+			if (isdigit(cuid[0])) {
+				nuid = atoi(cuid);
 				ngid = nuid;
 				if (nuid <= 0) {
 					syslog(LOG_ERR, "Numerical uid parameter invalid\n");
 					myexit(1);
 				}
 			} else {
-				pw = getpwnam(uid);
+				pw = getpwnam(cuid);
 				if (!pw || !pw->pw_uid) {
-					syslog(LOG_ERR, "Username %s in -U is invalid\n", uid);
+					syslog(LOG_ERR, "Username %s in -U is invalid\n", cuid);
 					myexit(1);
 				}
 				nuid = pw->pw_uid;
@@ -2501,9 +2477,9 @@ int main(int argc, char **argv) {
 	 * PID file requested? Try to create one (it must not exist).
 	 * If we fail, exit with error.
 	 */
-	if (strlen(pidfile)) {
+	if (strlen(cpidfile)) {
 		umask(0);
-		cd = open(pidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		cd = open(cpidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (cd < 0) {
 			syslog(LOG_ERR, "Error creating a new PID file\n");
 			myexit(1);
@@ -2517,16 +2493,6 @@ int main(int argc, char **argv) {
 	}
 
 	/*
-	 * Free already processed options.
-	 */
-	free(auth);
-	free(uid);
-	free(password);
-	free(cpassntlm2);
-	free(cpassnt);
-	free(cpasslm);
-
-	/*
 	 * Change the handler for signals recognized as clean shutdown.
 	 * When the handler is called (termination request), it signals
 	 * this news by adding 1 to the global quit variable.
@@ -2535,6 +2501,11 @@ int main(int argc, char **argv) {
 	signal(SIGINT, &sighandler);
 	signal(SIGTERM, &sighandler);
 	signal(SIGHUP, &sighandler);
+
+	/*
+	 * Initialize the random number generator
+	 */
+	srandom(time(NULL));
 
 	if (precache) {
 		pthread_attr_init(&pattr);
@@ -2582,6 +2553,15 @@ int main(int argc, char **argv) {
 		}
 
 		/*
+		 * Watch for SOCKS5 ports.
+		 */
+		t = socksd_list;
+		while (t) {
+			FD_SET(t->key, &set);
+			t = t->next;
+		}
+
+		/*
 		 * Watch for tunneled ports.
 		 */
 		t = tunneld_list;
@@ -2596,8 +2576,8 @@ int main(int argc, char **argv) {
 		/*
 		 * Wait here for data (connection request) on any of the listening 
 		 * sockets. When ready, establish the connection. For the main
-		 * port, a new process() thread is spawned to service the HTTP
-		 * request. For tunneled ports, autotunnel() thread is created.
+		 * port, a new proxy_thread() thread is spawned to service the HTTP
+		 * request. For tunneled ports, tunnel_thread() thread is created.
 		 * 
 		 */
 		cd = select(FD_SETSIZE, &set, NULL, NULL, &tv);
@@ -2636,16 +2616,18 @@ int main(int argc, char **argv) {
 					pthread_attr_setguardsize(&pattr, 0);
 #endif
 
-					if (!plist_in(proxyd_list, i)) {
+					if (plist_in(proxyd_list, i)) {
+						if (!serialize)
+							tid = pthread_create(&pthr, &pattr, proxy_thread, (void *)cd);
+						else
+							proxy_thread((void *)cd);
+					} else if (plist_in(socksd_list, i)) {
+						tid = pthread_create(&pthr, &pattr, socks5_thread, (void *)cd);
+					} else {
 						data = (struct thread_arg_s *)new(sizeof(struct thread_arg_s));
 						data->fd = cd;
 						data->target = plist_get(tunneld_list, i);
-						tid = pthread_create(&pthr, &pattr, autotunnel, (void *)data);
-					} else {
-						if (!serialize)
-							tid = pthread_create(&pthr, &pattr, process, (void *)cd);
-						else
-							process((void *)cd);
+						tid = pthread_create(&pthr, &pattr, tunnel_thread, (void *)data);
 					}
 
 					pthread_attr_destroy(&pattr);
@@ -2681,6 +2663,10 @@ int main(int argc, char **argv) {
 		}
 	}
 
+bailout:
+	if (strlen(cpidfile))
+		unlink(cpidfile);
+
 	syslog(LOG_INFO, "Terminating with %d active threads\n", tc - tj);
 	pthread_mutex_lock(&connection_mtx);
 	plist_free(connection_list);
@@ -2690,21 +2676,13 @@ int main(int argc, char **argv) {
 	plist_free(scanner_agent_list);
 	plist_free(tunneld_list);
 	plist_free(proxyd_list);
+	plist_free(socksd_list);
 	plist_free(rules);
 
-	if (strlen(pidfile))
-		unlink(pidfile);
-	if (passntlm2)
-		free(passntlm2);
-	if (passnt)
-		free(passnt);
-	if (passlm)
-		free(passlm);
-
-	free(pidfile);
-	free(user);
-	free(domain);
-	free(workstation);
+	free(cuid);
+	free(cpidfile);
+	free(magic_detect);
+	free_auth(creds);
 
 	parent_list = plist_free(parent_list);
 

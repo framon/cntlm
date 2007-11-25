@@ -26,6 +26,7 @@
 #include "config/config.h"
 
 #define BUFSIZE			1024
+#define MINIBUF_SIZE		50
 #define VAL(var, type, offset)	*((type *)(var+offset))
 #define MEM(var, type, offset)	(type *)(var+offset)
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
@@ -99,11 +100,11 @@ extern size_t strlcat(char *dst, const char *src, size_t siz);
 extern char *trimr(char *buf);
 extern char *lowercase(char *str);
 extern char *uppercase(char *str);
-extern inline int head_ok(const char *src);
+extern int head_ok(const char *src);
 extern char *head_name(const char *src);
 extern char *head_value(const char *src);
-extern inline int unicode(char **dst, char *src);
-extern inline char *new(size_t size);
+extern int unicode(char **dst, char *src);
+extern char *new(size_t size);
 extern char *urlencode(const char *str);
 
 extern rr_data_t new_rr_data(void);

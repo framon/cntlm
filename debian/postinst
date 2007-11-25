@@ -10,13 +10,13 @@ HOME=/var/run/cntlm
 
 # Create cntlm user and its homedir
 if ! getent passwd $NAME >/dev/null; then
-	adduser --system --ingroup nogroup --home $HOME --shell /bin/sh --disabled-password $NAME
+	adduser --system --home $HOME --shell /bin/sh --disabled-password $NAME
 fi
 
 if ! [ -d $HOME ]; then
 	mkdir -p $HOME
 	chmod 755 $HOME
-	chown -h -R $NAME:nogroup $HOME
+	chown -h -R $NAME $HOME
 fi
 
 #DEBHELPER#

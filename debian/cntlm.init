@@ -27,7 +27,7 @@ DESC="CNTLM Authentication Proxy"
 
 # Set default values
 PIDFILE=/var/run/cntlm/cntlm.pid
-TIMEOUT=5
+TIMEOUT=1
 RUNAS=cntlm
 
 test -x $DAEMON || exit 0
@@ -38,9 +38,17 @@ if [ -f /etc/default/cntlm ] ; then
 fi
 
 DAEMON_OPTS="$DAEMON_OPTS -U $RUNAS -P $PIDFILE"
+PIDDIR=`dirname $PIDFILE 2>/dev/null`
 
-function start {
+start() {
 	echo -n "Starting $DESC: "
+
+	if [ -n "$PIDDIR" -a ! -d "$PIDDIR" ]; then
+		mkdir -p "$PIDDIR" 2>/dev/null
+		chown "$RUNAS" "$PIDDIR" 2>/dev/null
+		chmod 755 "$PIDDIR" 2>/dev/null
+	fi
+
 	start-stop-daemon --oknodo --quiet --start --pidfile $PIDFILE --name $NAME --startas $DAEMON -- $DAEMON_OPTS 2>/dev/null
 	if [ $? -eq 0 ]; then
 		echo "$NAME."
@@ -49,7 +57,7 @@ function start {
 	fi
 }
 
-function stop {
+stop() {
 	echo -n "Stopping $DESC: "
 	start-stop-daemon --oknodo --quiet --stop --retry -HUP/$TIMEOUT/-HUP/2/-KILL/forever --pidfile $PIDFILE --name $NAME 2>/dev/null
 	if [ $? -eq 0 ]; then

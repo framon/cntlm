@@ -1,3 +1,26 @@
+cntlm (0.35.1-1) unstable; urgency=low
+
+  [ David Kubicek ]
+  * New upstream release
+  * Updated init script for non-persistent /var/run/cntlm (Ubuntu)
+  * Fixed #1835218
+  * Support and new test macros for Mac OS
+  * Automated ./configure && make system with compiler and arch detection
+
+ -- David Watson <dwatson@debian.org>  Fri, 25 Nov 2007 20:27:45 +0000
+
+cntlm (0.35-1) unstable; urgency=low
+
+  * New upstream release
+  * Built-in SOCKS5 proxy service
+  * Fixed #1806604 - allow NTLM-free (open) proxy
+  * Fixed #1820540 - Ubuntu /bin/sh (Dash) compatible
+  * Added __BSD_VISIBLE def for FreeBSD compilation
+  * Fixed typo which made tunnels unstable!
+  * Major code refactoring
+
+ -- David Kubicek <dave@awk.cz>  Fri, 02 Nov 2007 01:21:46 +0100
+
 cntlm (0.34.1-1) unstable; urgency=low
 
   * New upstream release

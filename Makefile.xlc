@@ -9,7 +9,7 @@ MANDIR=/usr/local/man
 #
 #
 CC=xlc_r
-OBJS=utils.o ntlm.o xcrypt.o config.o socket.o proxy.o
+OBJS=utils.o ntlm.o xcrypt.o config.o socket.o acl.o auth.o http.o proxy.o
 CFLAGS=$(FLAGS) -O3 -D_POSIX_C_SOURCE=200112 -D_ISOC99_SOURCE -D_REENTRANT -DVERSION=\"`cat VERSION`\"
 LDFLAGS=-lpthread
 NAME=cntlm
@@ -33,7 +33,10 @@ uninstall:
 	rm -f $(BINDIR)/$(NAME) $(MANDIR)/man1/$(NAME).1 2>/dev/null || true
 
 clean:
-	rm -f *.o tags cntlm pid massif* callgrind* 2>/dev/null
+	@rm -f *.o cntlm cntlm.exe configure-stamp build-stamp config/config.h 2>/dev/null
+	@rm -f cntlm-install win32/cyg* win32/cntlm* 2>/dev/null
+	@rm -f config/endian config/gethostname config/strdup config/socklen_t config/*.exe
+	@if [ -h Makefile ]; then rm -f Makefile; mv Makefile.gcc Makefile; fi
 
 proxy.o: proxy.c
 	if [ -z "$(SYSCONFDIR)" ]; then \
