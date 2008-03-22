@@ -1,6 +1,21 @@
-cntlm (0.35.1-1) unstable; urgency=low
+cntlm (0.35.1-3) unstable; urgency=low
 
-  [ David Kubicek ]
+  * Added watch file, thanks Kumar Appaiah. Closes: #471173. 
+
+ -- David Watson <dwatson@debian.org>  Sat, 22 Mar 2008 01:22:59 +0000
+
+cntlm (0.35.1-2) unstable; urgency=low
+
+  * Fix Dependencies. Closes: #459786.
+  * Updated Standards Version, no changes needed.
+  * Removed empty directory from package.
+  * Fixed hyphens in man page.
+
+ -- David Watson <dwatson@debian.org>  Tue, 08 Jan 2008 23:34:29 +0000
+
+cntlm (0.35.1-1) unstable; urgency=low 
+
+  [ David Kubicek ] 
   * New upstream release
   * Updated init script for non-persistent /var/run/cntlm (Ubuntu)
   * Fixed #1835218
@@ -9,7 +24,7 @@ cntlm (0.35.1-1) unstable; urgency=low
 
  -- David Watson <dwatson@debian.org>  Fri, 25 Nov 2007 20:27:45 +0000
 
-cntlm (0.35-1) unstable; urgency=low
+cntlm (0.35-1) unsta ble; urgency=low
 
   * New upstream release
   * Built-in SOCKS5 proxy service
@@ -21,7 +36,7 @@ cntlm (0.35-1) unstable; urgency=low
 
  -- David Kubicek <dave@awk.cz>  Fri, 02 Nov 2007 01:21:46 +0100
 
-cntlm (0.34.1-1) unstable; urgency=low
+cntlm (0.34.1-1) unst able; urgency=low
 
   * New upstream release
   * Move Homepage field from description
@@ -33,7 +48,7 @@ cntlm (0.33-1) unstable; urgency=low
   * New upstream release
 
  -- David Watson <dwatson@debian.org>  Tue, 31 Jul 2007 00:53:20 +0100
-
+ 
 cntlm (0.32-1) unstable; urgency=low
 
   * New upstream relase
@@ -44,14 +59,14 @@ cntlm (0.32-1) unstable; urgency=low
         - builtin "access denied" page
 
  -- David Kubicek <dave@awk.cz>  Thu, 12 Jul 2007 16:23:20 +0200
-
+ 
 cntlm (0.31.1-1) unstable; urgency=low
 
   * New upstream release
   * Full support + fix for chunked encoding (incl. extensions and trailers)
 
  -- David Kubicek <dave@awk.cz>  Mon, 09 Jul 2007 15:01:43 +0200
-
+ 
 cntlm (0.31-1) unstable; urgency=low
 
   * New upstream release

@@ -3,12 +3,12 @@ Section: net
 Priority: optional
 Maintainer: David Watson <dwatson@debian.org>
 Build-Depends: debhelper (>= 5)
-Standards-Version: 3.7.2
+Standards-Version: 3.7.3
 Homepage: http://cntlm.sourceforge.net/
 
 Package: cntlm
 Architecture: any
-Depends: adduser, libc6 (>= 2.2)
+Depends: adduser, ${misc:Depends}, ${shlibs:Depends}
 Replaces: ntlmaps
 Description: Fast NTLM authentication proxy with tunneling
  Cntlm is a fast and efficient NTLM proxy, with support for TCP/IP tunneling,
