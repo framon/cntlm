@@ -1,3 +1,11 @@
+cntlm (0.35.1-4) unstable; urgency=low
+
+  * Add set -e to prerm script.
+  * Add vcs fields to control.
+  * Update Standards Version, no changes needed.
+
+ -- David Watson <dwatson@debian.org>  Fri, 10 Oct 2008 22:00:42 +0100
+
 cntlm (0.35.1-3) unstable; urgency=low
 
   * Added watch file, thanks Kumar Appaiah. Closes: #471173. 
@@ -24,7 +32,7 @@ cntlm (0.35.1-1) unstable; urgency=low
 
  -- David Watson <dwatson@debian.org>  Fri, 25 Nov 2007 20:27:45 +0000
 
-cntlm (0.35-1) unsta ble; urgency=low
+cntlm (0.35-1) unstable; urgency=low
 
   * New upstream release
   * Built-in SOCKS5 proxy service
@@ -36,7 +44,7 @@ cntlm (0.35-1) unsta ble; urgency=low
 
  -- David Kubicek <dave@awk.cz>  Fri, 02 Nov 2007 01:21:46 +0100
 
-cntlm (0.34.1-1) unst able; urgency=low
+cntlm (0.34.1-1) unstable; urgency=low
 
   * New upstream release
   * Move Homepage field from description
