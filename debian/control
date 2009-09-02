@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: David Watson <dwatson@debian.org>
 Build-Depends: debhelper (>= 5)
-Standards-Version: 3.8.0
+Standards-Version: 3.8.3
 Vcs-Git: git://planetwatson.co.uk/cntlm
 Vcs-Browser: http://projects.planetwatson.co.uk/repositories/show/cntlm
 Homepage: http://cntlm.sourceforge.net/
