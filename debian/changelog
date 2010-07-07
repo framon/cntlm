@@ -1,3 +1,10 @@
+cntlm (0.35.1-5ubuntu1) maverick; urgency=low
+
+  * Add ifup.d script, as cntlm may start before required interface is up
+    (LP: #358298)
+
+ -- Stefano Rivera <stefanor@ubuntu.com>  Tue, 06 Jul 2010 15:13:35 +0200
+
 cntlm (0.35.1-5) unstable; urgency=low
 
   * Fix lintian errors in debian/copyright 

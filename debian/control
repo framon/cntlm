@@ -1,7 +1,8 @@
 Source: cntlm
 Section: net
 Priority: optional
-Maintainer: David Watson <dwatson@debian.org>
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+XSBC-Original-Maintainer: David Watson <dwatson@debian.org>
 Build-Depends: debhelper (>= 5)
 Standards-Version: 3.8.3
 Vcs-Git: git://planetwatson.co.uk/cntlm

@@ -1,0 +1,6 @@
+#!/bin/sh
+# In case we couldn't start earlier because the necessary interface wasn't up,
+# try and start again now. LP: #358298
+set -e
+
+invoke-rc.d --quiet cntlm start >/dev/null 2>&1 || true
