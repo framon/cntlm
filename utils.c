@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <ctype.h>
+#include <syslog.h>
 
 #include "config/config.h"
 #include "swap.h"
@@ -42,16 +43,32 @@ int hexindex[128] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
 	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,10,11,12,13,14,15,-1,-1,-1,-1,-1,
 	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
 
+void myexit(int rc) {
+	if (rc)
+		fprintf(stderr, "Exitting with error. Check daemon logs or run with -v.\n");
+	
+	exit(rc);
+}
+
+void croak(const char *msg, int console) {
+	if (console)
+		printf("%s", msg);
+	else
+		syslog(LOG_ERR, "%s", msg);
+	
+	myexit(1);
+}
+
 /*
  * Add a new item to a list. Every plist_t variable must be 
  * initialized to NULL (or pass NULL for "list" when adding
- * the first item). This is required to strip down the 
- * complexity to minimum and not to need any plist_new func.
+ * the first item). This is for simplicity's sake (we don't
+ * need any plist_new).
  *
  * This list type allows to store an arbitrary pointer
  * associating it with the key.
  */
-plist_t plist_add(plist_t list, unsigned long key, char *aux) {
+plist_t plist_add(plist_t list, unsigned long key, void *aux) {
 	plist_t tmp, t = list;
 
 	tmp = malloc(sizeof(struct plist_s));
@@ -87,6 +104,8 @@ plist_t plist_del(plist_t list, unsigned long key) {
 	if (t) {
 		plist_t tmp = t->next;
 
+		if (t->aux)
+			free(t->aux);
 		free(t);
 		if (ot == NULL)
 			return tmp;
@@ -121,7 +140,7 @@ void plist_dump(plist_t list) {
 
 	t = list;
 	while (t) {
-		printf("List data: %lu => %s\n", (unsigned long int)t->key, t->aux);
+		printf("List data: %lu => 0x%08x\n", (unsigned long int)t->key, (unsigned int)t->aux);
 		t = t->next;
 	}
 }
@@ -146,15 +165,21 @@ char *plist_get(plist_t list, int key) {
  * discarding all closed ones on the way. Return the first
  * match.
  *
+ * Use this method only for lists of descriptors!
+ *
  * In conjunction with plist_add, the list behaves as a FIFO.
  * This feature is used for rotating cached connections in the
  * list, so that none is left too long unused (proxy timeout).
- * Returns only key, not aux.
+ *
+ * Returns key value (descriptor) and if aux != NULL, *aux gets
+ * aux pointer value (which caller must free if != NULL).
  */
-int plist_pop(plist_t *list) {
+
+int plist_pop(plist_t *list, void **aux) {
 	plist_t tmp, t;
 	int id = 0;
 	int ok = 0;
+	void *a = NULL;
 
 	if (list == NULL || *list == NULL)
 		return 0;
@@ -162,11 +187,14 @@ int plist_pop(plist_t *list) {
 	t = *list;
 	while (!ok && t) {
 		id = t->key;
+		a = t->aux;
 		tmp = t->next;
 
-		if (so_closed(id))
+		if (so_closed(id)) {
 			close(id);
-		else
+			if (t->aux)
+				free(t->aux);
+		} else
 			ok = 1;
 
 		free(t);
@@ -175,7 +203,13 @@ int plist_pop(plist_t *list) {
 
 	*list = t;
 
-	return (ok ? id : 0);
+	if (ok) {
+		if (aux != NULL)
+			*aux = a;
+		return id;
+	}
+
+	return 0;
 }
 
 /*
@@ -183,14 +217,14 @@ int plist_pop(plist_t *list) {
  */
 int plist_count(plist_t list) {
 	plist_t t = list;
-	int ret = 0;
+	int rc = 0;
 
 	while (t) {
-		ret++;
+		rc++;
 		t = t->next;
 	}
 
-	return ret;
+	return rc;
 }
 
 /*
@@ -212,27 +246,27 @@ plist_t plist_free(plist_t list) {
 
 /*
  * The same as plist_add. Here we have two other arguments.
- * They are treated as booleans - true means to duplicate a
- * key/value, false means to store the pointer directly.
+ * They are boolean flags - HLIST_ALLOC means to duplicate a
+ * key/value, HLIST_NOALLOC means to store the pointer directly.
  *
  * Caller decides this on a by-call basis. Part of the manipulation
  * routines is a "free". That method always deallocates both the
  * key and the value. So for static or temporary keys/values,
- * the caller instructs us to duplicate the necessary amount 
+ * the caller can instruct us to duplicate the necessary amount 
  * of heap. This mechanism is used to minimize memory-related
- * bugs throughout the code and tens of free's in the main
- * module.
+ * bugs throughout the code and tons of free's.
  */
-hlist_t hlist_add(hlist_t list, char *key, char *value, int allockey, int allocvalue) {
+hlist_t hlist_add(hlist_t list, char *key, char *value, hlist_add_t allockey, hlist_add_t allocvalue) {
 	hlist_t tmp, t = list;
 
 	if (key == NULL || value == NULL)
 		return list;
 
 	tmp = malloc(sizeof(struct hlist_s));
-	tmp->key = (allockey ? strdup(key) : key);
-	tmp->value = (allocvalue ? strdup(value) : value);
+	tmp->key = (allockey == HLIST_ALLOC ? strdup(key) : key);
+	tmp->value = (allocvalue == HLIST_ALLOC ? strdup(value) : value);
 	tmp->next = NULL;
+	tmp->islist = 0;
 
 	if (list == NULL)
 		return tmp;
@@ -252,7 +286,7 @@ hlist_t hlist_dup(hlist_t list) {
 	hlist_t tmp = NULL, t = list;
 
 	while (t) {
-		tmp = hlist_add(tmp, t->key, t->value, 1, 1);
+		tmp = hlist_add(tmp, t->key, t->value, HLIST_ALLOC, HLIST_ALLOC);
 		t = t->next;
 	}
 
@@ -309,7 +343,7 @@ hlist_t hlist_mod(hlist_t list, char *key, char *value, int add) {
 		free(t->value);
 		t->value = strdup(value);
 	} else if (add) {
-		list = hlist_add(list, key, value, 1, 1);
+		list = hlist_add(list, key, value, HLIST_ALLOC, HLIST_ALLOC);
 	}
 
 	return list;
@@ -335,14 +369,14 @@ int hlist_in(hlist_t list, const char *key) {
  */
 int hlist_count(hlist_t list) {
 	hlist_t t = list;
-	int ret = 0;
+	int rc = 0;
 
 	while (t) {
-		ret++;
+		rc++;
 		t = t->next;
 	}
 
-	return ret;
+	return rc;
 }
 
 /*
@@ -368,17 +402,42 @@ int hlist_subcmp(hlist_t list, const char *key, const char *substr) {
 	int found = 0;
 	char *tmp, *low;
 
+	lowercase(low = strdup(substr));
 	tmp = hlist_get(list, key);
 	if (tmp) {
 		lowercase(tmp = strdup(tmp));
-		lowercase(low = strdup(substr));
-		if (strstr(tmp, substr))
+		if (strstr(tmp, low))
 			found = 1;
 
-		free(low);
 		free(tmp);
 	}
 
+	free(low);
+	return found;
+}
+
+/*
+ * Test if substr is part of the header's value.
+ * Both case-insensitive, checks all headers, not just first one.
+ */
+int hlist_subcmp_all(hlist_t list, const char *key, const char *substr) {
+	hlist_t t = list;
+	int found = 0;
+	char *tmp, *low;
+
+	lowercase(low = strdup(substr));
+	while (t) {
+		if (!strcasecmp(t->key, key)) {
+			lowercase(tmp = strdup(t->value));
+			if (strstr(tmp, low))
+				found = 1;
+
+			free(tmp);
+		}
+		t = t->next;
+	}
+
+	free(low);
 	return found;
 }
 
@@ -428,50 +487,12 @@ char *substr(const char *src, int pos, int len) {
 
 	l = MIN(len, strlen(src)-pos);
 	if (l <= 0)
-		return NULL;
+		return new(1);
 
 	tmp = new(l+1);
 	strlcpy(tmp, src+pos, l+1);
 
 	return tmp;
-}
-
-/*
- * Ture if src is a header. This is just a basic check
- * for the colon delimiter. Might eventually become more
- * sophisticated. :)
- */
-int head_ok(const char *src) {
-	return strcspn(src, ":") != strlen(src);
-}
-
-/*
- * Extract the header name from the source.
- */
-char *head_name(const char *src) {
-	int i;
-
-	i = strcspn(src, ":");
-	if (i != strlen(src))
-		return substr(src, 0, i);
-	else
-		return NULL;
-}
-
-/*
- * Extract the header value from the source.
- */
-char *head_value(const char *src) {
-	char *sub;
-
-	if ((sub = strchr(src, ':'))) {
-		sub++;
-		while (*sub == ' ')
-			sub++;
-
-		return strdup(sub);
-	} else
-		return NULL;
 }
 
 /*
@@ -484,13 +505,57 @@ rr_data_t new_rr_data(void) {
 	data->req = 0;
 	data->code = 0;
 	data->skip_http = 0;
+	data->body_len = 0;
+	data->empty = 1;
+	data->port = 0;
 	data->headers = NULL;
 	data->method = NULL;
 	data->url = NULL;
+	data->rel_url = NULL;
+	data->hostname = NULL;
 	data->http = NULL;
 	data->msg = NULL;
+	data->body = NULL;
+	data->errmsg = NULL; 			/* for static strings - we don't free, dup, nor copy */
 
 	return data;
+}
+
+/*
+ * Copy the req/res data.
+ */
+rr_data_t copy_rr_data(rr_data_t dst, rr_data_t src) {
+	if (src == NULL || dst == NULL)
+		return NULL;
+
+	reset_rr_data(dst);
+	dst->req = src->req;
+	dst->code = src->code;
+	dst->skip_http = src->skip_http;
+	dst->body_len = src->body_len;
+	dst->empty = src->empty;
+	dst->port = src->port;
+
+	if (src->headers)
+		dst->headers = hlist_dup(src->headers);
+	if (src->method)
+		dst->method = strdup(src->method);
+	if (src->url)
+		dst->url = strdup(src->url);
+	if (src->rel_url)
+		dst->rel_url = strdup(src->rel_url);
+	if (src->hostname)
+		dst->hostname = strdup(src->hostname);
+	if (src->http)
+		dst->http = strdup(src->http);
+	if (src->msg)
+		dst->msg = strdup(src->msg);
+	if (src->body && src->body_len > 0) {
+		dst->body = new(src->body_len);
+		memcpy(dst->body, src->body, src->body_len);
+	}
+	
+	return dst;
 }
 
 /*
@@ -503,21 +568,43 @@ rr_data_t dup_rr_data(rr_data_t data) {
 		return NULL;
 
 	tmp = new_rr_data();
-	tmp->req = data->req;
-	tmp->code = data->code;
-	tmp->skip_http = data->skip_http;
-	if (data->headers)
-		tmp->headers = hlist_dup(data->headers);
-	if (data->method)
-		tmp->method = strdup(data->method);
-	if (data->url)
-		tmp->url = strdup(data->url);
-	if (data->http)
-		tmp->http = strdup(data->http);
-	if (data->msg)
-		tmp->msg = strdup(data->msg);
-	
-	return tmp;
+	return copy_rr_data(tmp, data);
+}
+
+/*
+ * Reset, freeing if neccessary
+ */
+rr_data_t reset_rr_data(rr_data_t data) {
+	if (data == NULL)
+		return NULL;
+
+	data->req = 0;
+	data->code = 0;
+	data->skip_http = 0;
+	data->body_len = 0;
+	data->empty = 1;
+	data->port = 0;
+
+	if (data->headers) hlist_free(data->headers);
+	if (data->method) free(data->method);
+	if (data->url) free(data->url);
+	if (data->rel_url) free(data->rel_url);
+	if (data->hostname) free(data->hostname);
+	if (data->http) free(data->http);
+	if (data->msg) free(data->msg);
+	if (data->body) free(data->body);
+
+	data->headers = NULL;
+	data->method = NULL;
+	data->url = NULL;
+	data->rel_url = NULL;
+	data->hostname = NULL;
+	data->http = NULL;
+	data->msg = NULL;
+	data->body = NULL;
+	data->errmsg = NULL;
+
+	return data;
 }
 
 /*
@@ -531,8 +618,11 @@ void free_rr_data(rr_data_t data) {
 	if (data->headers) hlist_free(data->headers);
 	if (data->method) free(data->method);
 	if (data->url) free(data->url);
+	if (data->rel_url) free(data->rel_url);
+	if (data->hostname) free(data->hostname);
 	if (data->http) free(data->http);
 	if (data->msg) free(data->msg);
+	if (data->body) free(data->body);
 	free(data);
 }
 
@@ -542,9 +632,7 @@ void free_rr_data(rr_data_t data) {
 char *trimr(char *buf) {
 	int i;
 
-	i = strlen(buf)-1;
-	while (i >= 0 && (buf[i] == '\r' || buf[i] == '\n' || buf[i] == '\t' || buf[i] == ' '))
-		i--;
+	for (i = strlen(buf)-1; i >= 0 && isspace(buf[i]); --i);
 	buf[i+1] = 0;
 
 	return buf;
@@ -558,10 +646,13 @@ char *strdup(const char *src) {
 	size_t len;
 	char *tmp;
 
+	if (!src)
+		return NULL;
+
 	len = strlen(src)+1;
-	tmp = malloc(len);
-	memcpy(tmp, src, len);
-	
+	tmp = calloc(1, len);
+	memcpy(tmp, src, len-1);
+
 	return tmp;
 }
 #endif
@@ -662,7 +753,7 @@ char *uppercase(char *str) {
 }
 
 int unicode(char **dst, char *src) {
-	char *ret;
+	char *tmp;
 	int l, i;
 
 	if (!src) {
@@ -671,11 +762,11 @@ int unicode(char **dst, char *src) {
 	}
 
 	l = MIN(64, strlen(src));
-	ret = new(2*l);
+	tmp = new(2*l);
 	for (i = 0; i < l; ++i)
-		ret[2*i] = src[i];
+		tmp[2*i] = src[i];
 
-	*dst = ret;
+	*dst = tmp;
 	return 2*l;
 }
 
