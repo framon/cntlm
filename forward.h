@@ -1,6 +1,4 @@
 /*
- * These are socket routines for the main module of CNTLM
- *
  * CNTLM is free software; you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation; either version 2 of the License, or (at your option) any later
@@ -19,27 +17,17 @@
  *
  */
 
-#ifndef _SOCKET_H
-#define _SOCKET_H
+#ifndef _FORWARD_H
+#define _FORWARD_H
 
-#include <netinet/in.h>
-#include <stdint.h>
+#include "utils.h"
+#include "auth.h"
 
-#include "config/config.h"
+extern int proxy_connect(struct auth_s *credentials);
+extern int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct auth_s *creds);
+extern int prepare_http_connect(int sd, struct auth_s *credentials, const char *thost);
+extern rr_data_t forward_request(void *cdata, rr_data_t request);
+extern void forward_tunnel(void *thread_data);
+extern void magic_auth_detect(const char *url);
 
-#if config_socklen_t != 1
-#define socklen_t uint32_t
-#endif
-
-#ifndef INADDR_LOOPBACK
-#define INADDR_LOOPBACK 0x7f000001
-#endif
-
-extern int so_resolv(struct in_addr *host, const char *name);
-extern int so_connect(struct in_addr host, int port);
-extern int so_listen(int port, struct in_addr source);
-extern int so_dataready(int fd);
-extern int so_closed(int fd);
-extern int so_recvln(int fd, char **buf, int *size);
-
-#endif /* _SOCKET_H */
+#endif /* _FORWARD_H */

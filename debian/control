@@ -3,7 +3,7 @@ Section: net
 Priority: optional
 Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
 XSBC-Original-Maintainer: David Watson <dwatson@debian.org>
-Build-Depends: debhelper (>= 5)
+Build-Depends: debhelper (>= 5.0.44~)
 Standards-Version: 3.8.3
 Vcs-Git: git://planetwatson.co.uk/cntlm
 Vcs-Browser: http://projects.planetwatson.co.uk/repositories/show/cntlm

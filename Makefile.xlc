@@ -9,7 +9,7 @@ MANDIR=/usr/local/man
 #
 #
 CC=xlc_r
-OBJS=utils.o ntlm.o xcrypt.o config.o socket.o acl.o auth.o http.o proxy.o
+OBJS=utils.o ntlm.o xcrypt.o config.o socket.o acl.o auth.o http.o forward.o direct.o scanner.o pages.o main.o
 CFLAGS=$(FLAGS) -O3 -D_POSIX_C_SOURCE=200112 -D_ISOC99_SOURCE -D_REENTRANT -DVERSION=\"`cat VERSION`\"
 LDFLAGS=-lpthread
 NAME=cntlm
@@ -17,16 +17,23 @@ NAME=cntlm
 $(NAME): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
+main.o: main.c
+	if [ -z "$(SYSCONFDIR)" ]; then \
+		$(CC) $(CFLAGS) -c main.c -o $@; \
+	else \
+		$(CC) $(CFLAGS) -DSYSCONFDIR=\"$(SYSCONFDIR)\" -c main.c -o $@; \
+	fi
+
 install: $(NAME)
 	if [ -f /usr/bin/oslevel ]; then \
-		install -O root -G system -M 0755 -S -f $(BINDIR) $(NAME); \
-		install -O root -G system -M 0644 -f $(MANDIR)/man1 doc/$(NAME).1; \
-		install -O root -G system -M 0600 -c $(SYSCONFDIR) doc/$(NAME).conf; \
+		install -M 0755 -S -f $(BINDIR) $(NAME); \
+		install -M 0644 -f $(MANDIR)/man1 doc/$(NAME).1; \
+		install -M 0600 -c $(SYSCONFDIR) doc/$(NAME).conf; \
 	else \
-		install -D -o root -g root -m 0755 -s $(NAME) $(BINDIR)/$(NAME); \
-		install -D -o root -g root -m 0644 doc/$(NAME).1 $(MANDIR)/man1/$(NAME).1; \
+		install -D -m 0755 -s $(NAME) $(BINDIR)/$(NAME); \
+		install -D -m 0644 doc/$(NAME).1 $(MANDIR)/man1/$(NAME).1; \
 		[ -f $(SYSCONFDIR)/$(NAME).conf -o -z "$(SYSCONFDIR)" ] \
-			|| install -D -o root -g root -m 0600 doc/$(NAME).conf $(SYSCONFDIR)/$(NAME).conf; \
+			|| install -D -m 0600 doc/$(NAME).conf $(SYSCONFDIR)/$(NAME).conf; \
 	fi
 
 uninstall:
@@ -34,13 +41,9 @@ uninstall:
 
 clean:
 	@rm -f *.o cntlm cntlm.exe configure-stamp build-stamp config/config.h 2>/dev/null
-	@rm -f cntlm-install win32/cyg* win32/cntlm* 2>/dev/null
+	@rm -f cntlm-install win/cyg* win/cntlm* 2>/dev/null
 	@rm -f config/endian config/gethostname config/strdup config/socklen_t config/*.exe
 	@if [ -h Makefile ]; then rm -f Makefile; mv Makefile.gcc Makefile; fi
 
-proxy.o: proxy.c
-	if [ -z "$(SYSCONFDIR)" ]; then \
-		$(CC) $(CFLAGS) -c proxy.c -o $@; \
-	else \
-		$(CC) $(CFLAGS) -DSYSCONFDIR=\"$(SYSCONFDIR)\" -c proxy.c -o $@; \
-	fi
+distclean: clean
+	@rm -f *.deb *.rpm *.tgz *.tar.gz *.tar.bz2 tags ctags pid 2>/dev/null

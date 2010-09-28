@@ -1,3 +1,9 @@
+cntlm (0.91~rc6-0ubuntu1) maverick; urgency=low
+
+  * New Upstream pre-release (LP: #649171)
+
+ -- Stefano Rivera <stefanor@ubuntu.com>  Tue, 28 Sep 2010 18:05:06 +0200
+
 cntlm (0.35.1-5ubuntu1) maverick; urgency=low
 
   * Add ifup.d script, as cntlm may start before required interface is up

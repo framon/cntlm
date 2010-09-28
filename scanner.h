@@ -1,6 +1,4 @@
 /*
- * These are socket routines for the main module of CNTLM
- *
  * CNTLM is free software; you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation; either version 2 of the License, or (at your option) any later
@@ -19,27 +17,25 @@
  *
  */
 
-#ifndef _SOCKET_H
-#define _SOCKET_H
+#ifndef _SCANNER_H
+#define _SCANNER_H
 
-#include <netinet/in.h>
-#include <stdint.h>
+#include "utils.h"
 
-#include "config/config.h"
+/*
+ * ISA plugin flags
+ */
+#define PLUG_NONE	0x0000
+#define PLUG_SENDHEAD	0x0001
+#define PLUG_SENDDATA	0x0002
+#define PLUG_ERROR	0x8000
+#define PLUG_ALL	0x7FFF
 
-#if config_socklen_t != 1
-#define socklen_t uint32_t
-#endif
+/*
+ * Plugin download sample size
+ */
+#define SAMPLE		4096
 
-#ifndef INADDR_LOOPBACK
-#define INADDR_LOOPBACK 0x7f000001
-#endif
+extern int scanner_hook(rr_data_t request, rr_data_t response, struct auth_s *credentials, int cd, int *sd, long maxKBs);
 
-extern int so_resolv(struct in_addr *host, const char *name);
-extern int so_connect(struct in_addr host, int port);
-extern int so_listen(int port, struct in_addr source);
-extern int so_dataready(int fd);
-extern int so_closed(int fd);
-extern int so_recvln(int fd, char **buf, int *size);
-
-#endif /* _SOCKET_H */
+#endif /* _SCANNER_H */
