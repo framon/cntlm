@@ -1,3 +1,10 @@
+cntlm (0.91~rc6-0ubuntu1.1) maverick-proposed; urgency=low
+
+  * Remove unnecessary and invalid forever from start-stop-daemon's --retry
+    schedule (LP: #660515)
+
+ -- Stefano Rivera <stefanor@ubuntu.com>  Sat, 16 Oct 2010 21:14:32 +0200
+
 cntlm (0.91~rc6-0ubuntu1) maverick; urgency=low
 
   * New Upstream pre-release (LP: #649171)
