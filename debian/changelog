@@ -1,4 +1,4 @@
-cntlm (0.91~rc6-0ubuntu1.2) natty; urgency=low
+cntlm (0.91~rc6-0ubuntu2) natty; urgency=low
 
   * When a network interface goes up, before starting cntlm check whether
     it is enabled in current runlevel (LP: #733537)
