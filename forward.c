@@ -59,20 +59,38 @@ int proxy_connect(struct auth_s *credentials) {
 	pthread_mutex_lock(&parent_mtx);
 	if (parent_curr == 0) {
 		aux = (proxy_t *)plist_get(parent_list, ++parent_curr);
-		syslog(LOG_INFO, "Using proxy %s:%d\n", inet_ntoa(aux->host), aux->port);
+		syslog(LOG_INFO, "Using proxy %s:%d\n", aux->hostname, aux->port);
 	}
 	pthread_mutex_unlock(&parent_mtx);
 
 	do {
+		pthread_mutex_lock(&parent_mtx);
 		aux = (proxy_t *)plist_get(parent_list, parent_curr);
-		i = so_connect(aux->host, aux->port);
+		pthread_mutex_unlock(&parent_mtx);
+		if (aux->resolved == 0) {
+			if (debug)
+				syslog(LOG_INFO, "Resolving proxy %s...\n", aux->hostname);
+			if (so_resolv(&aux->host, aux->hostname)) {
+				aux->resolved = 1;
+			} else {
+				syslog(LOG_ERR, "Cannot resolve proxy %s\n", aux->hostname);
+			}
+		}
+
+		i = 0;
+		if (aux->resolved != 0)
+			i = so_connect(aux->host, aux->port);
+
+		/*
+		 * Resolve or connect failed?
+		 */
 		if (i <= 0) {
 			pthread_mutex_lock(&parent_mtx);
 			if (parent_curr >= parent_count)
 				parent_curr = 0;
 			aux = (proxy_t *)plist_get(parent_list, ++parent_curr);
 			pthread_mutex_unlock(&parent_mtx);
-			syslog(LOG_ERR, "Proxy connect failed, will try %s:%d\n", inet_ntoa(aux->host), aux->port);
+			syslog(LOG_ERR, "Proxy connect failed, will try %s:%d\n", aux->hostname, aux->port);
 		}
 	} while (i <= 0 && ++loop < parent_count);
 
@@ -127,7 +145,7 @@ int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct au
 	strcpy(buf, "NTLM ");
 	len = ntlm_request(&tmp, credentials);
 	if (len) {
-		to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
+		to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
 		free(tmp);
 	}
 
@@ -215,7 +233,7 @@ int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct au
 				len = ntlm_response(&tmp, challenge, len, credentials);
 				if (len > 0) {
 					strcpy(buf, "NTLM ");
-					to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
+					to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
 					request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
 					free(tmp);
 				} else {
@@ -323,7 +341,9 @@ beginning:
 
 	if (debug) {
 		printf("Thread processing%s...\n", retry ? " (retry)" : "");
+		pthread_mutex_lock(&connection_mtx);
 		plist_dump(connection_list);
+		pthread_mutex_unlock(&connection_mtx);
 	}
 
 	/*
@@ -713,7 +733,7 @@ int prepare_http_connect(int sd, struct auth_s *credentials, const char *thost) 
 	data1->req = 1;
 	data1->method = strdup("CONNECT");
 	data1->url = strdup(thost);
-	data1->http = strdup("1");
+	data1->http = strdup("HTTP/1.1");
 	data1->headers = hlist_mod(data1->headers, "Proxy-Connection", "keep-alive", 1);
 
 	/*
@@ -843,7 +863,7 @@ void magic_auth_detect(const char *url) {
 		req->req = 1;
 		req->method = strdup("GET");
 		req->url = strdup(url);
-		req->http = strdup("1");
+		req->http = strdup("HTTP/1.1");
 		req->headers = hlist_add(req->headers, "Proxy-Connection", "keep-alive", HLIST_ALLOC, HLIST_ALLOC);
 		if (host)
 			req->headers = hlist_add(req->headers, "Host", host, HLIST_ALLOC, HLIST_ALLOC);

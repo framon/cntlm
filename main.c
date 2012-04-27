@@ -125,7 +125,6 @@ int parent_add(char *parent, int port) {
 	int len, i;
 	char *proxy;
 	proxy_t *aux;
-	struct in_addr host;
 
 	/*
 	 * Check format and parse it.
@@ -157,7 +156,7 @@ int parent_add(char *parent, int port) {
 
 	/*
 	 * Try to resolve proxy address
-	 */
+	 *
 	if (debug)
 		syslog(LOG_INFO, "Resolving proxy %s...\n", proxy);
 	if (!so_resolv(&host, proxy)) {
@@ -165,10 +164,12 @@ int parent_add(char *parent, int port) {
 		free(proxy);
 		return 0;
 	}
+	*/
 
 	aux = (proxy_t *)new(sizeof(proxy_t));
-	aux->host = host;
+	strlcpy(aux->hostname, proxy, sizeof(aux->hostname));
 	aux->port = port;
+	aux->resolved = 0;
 	parent_list = plist_add(parent_list, ++parent_count, (char *)aux);
 
 	free(proxy);
@@ -222,7 +223,7 @@ void tunnel_add(plist_t *list, char *spec, int gateway) {
 	spec = strdup(spec);
 	len = strlen(spec);
 	field[0] = spec;
-	for (count = 1, i = 0; i < len; ++i)
+	for (count = 1, i = 0; count < 4 && i < len; ++i)
 		if (spec[i] == ':') {
 			spec[i] = 0;
 			field[count++] = spec+i+1;
@@ -346,7 +347,7 @@ void *proxy_thread(void *thread_data) {
 				ret = forward_request(thread_data, request);
 
 			if (debug)
-				printf("proxy_thread: request rc = %x\n", (int)ret);
+				printf("proxy_thread: request rc = %p\n", (void *)ret);
 		} while (ret != NULL && ret != (void *)-1);
 
 		free_rr_data(request);
@@ -948,14 +949,15 @@ int main(int argc, char **argv) {
 #ifdef SYSCONFDIR
 	if (!cf) {
 #ifdef __CYGWIN__
-		tmp = getenv("PROGRAMFILES");
-		if (tmp == NULL) {
+		tmp = getenv("PROGRAMFILES(X86)");
+		if (tmp == NULL || strlen(tmp) == 0)
+			tmp = getenv("PROGRAMFILES");
+		if (tmp == NULL)
 			tmp = "C:\\Program Files";
-		}
 
 		head = new(MINIBUF_SIZE);
 		strlcpy(head, tmp, MINIBUF_SIZE);
-		strlcat(head, "\\cntlm\\cntlm.ini", MINIBUF_SIZE);
+		strlcat(head, "\\Cntlm\\cntlm.ini", MINIBUF_SIZE);
 		cf = config_open(head);
 #else
 		cf = config_open(SYSCONFDIR "/cntlm.conf");
@@ -1194,7 +1196,7 @@ int main(int argc, char **argv) {
 	/*
 	 * Last chance to get password from the user
 	 */
-	if (interactivehash || (interactivepwd && !ntlmbasic)) {
+	if (interactivehash || magic_detect || (interactivepwd && !ntlmbasic)) {
 		printf("Password: ");
 		tcgetattr(0, &termold);
 		termnew = termold;
@@ -1202,8 +1204,12 @@ int main(int argc, char **argv) {
 		tcsetattr(0, TCSADRAIN, &termnew);
 		tmp = fgets(cpassword, MINIBUF_SIZE, stdin);
 		tcsetattr(0, TCSADRAIN, &termold);
-		i = strlen(cpassword)-1;
-		trimr(cpassword);
+		i = strlen(cpassword) - 1;
+		if (cpassword[i] == '\n') {
+			cpassword[i] = 0;
+			if (cpassword[i - 1] == '\r')
+				cpassword[i - 1] = 0;
+		}
 		printf("\n");
 	}
 
@@ -1437,7 +1443,7 @@ int main(int argc, char **argv) {
 	 * after the first kill) and a "forced" one (user insists and
 	 * killed us twice).
 	 */
-	while (quit < 1 || tc != tj) {
+	while (quit == 0 || (tc != tj && quit < 2)) {
 		struct thread_arg_s *data;
 		struct sockaddr_in caddr;
 		struct timeval tv;
