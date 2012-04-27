@@ -2,8 +2,8 @@
 #
 ### BEGIN INIT INFO
 # Provides:          cntlm
-# Required-Start:    $syslog $time
-# Required-Stop:     $syslog $time
+# Required-Start:    $remote_fs $syslog $time $network
+# Required-Stop:     $remote_fs $syslog $time $network
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
 # Short-Description: Authenticating HTTP accelerator for NTLM secured proxies
@@ -32,6 +32,9 @@ RUNAS=cntlm
 
 test -x $DAEMON || exit 0
 
+. /lib/lsb/init-functions
+test -r /etc/default/rcS && . /etc/default/rcS
+
 # Include custom values if available
 if [ -f /etc/default/cntlm ] ; then
 	. /etc/default/cntlm
@@ -59,7 +62,7 @@ start() {
 
 stop() {
 	echo -n "Stopping $DESC: "
-	start-stop-daemon --oknodo --quiet --stop --retry -HUP/$TIMEOUT/-HUP/2/-KILL/forever --pidfile $PIDFILE --name $NAME 2>/dev/null
+	start-stop-daemon --oknodo --quiet --stop --retry -HUP/$TIMEOUT/-HUP/2/forever/-KILL --pidfile $PIDFILE --name $NAME
 	if [ $? -eq 0 ]; then
 		echo "$NAME."
 	else
@@ -78,8 +81,11 @@ case "$1" in
 		stop
 		start
 		;;
+	status)
+	  status_of_proc -p $PIDFILE $DAEMON $NAME && exit 0 || exit $?
+	  ;;
 	*)
-		echo "Usage: $0 {start|stop|restart|reload|force-reload}" >&2
+		echo "Usage: $0 {start|stop|restart|reload|force-reload|status}" >&2
 		exit 2
 		;;
 esac

@@ -1,6 +1,4 @@
 /*
- * These are socket routines for the main module of CNTLM
- *
  * CNTLM is free software; you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation; either version 2 of the License, or (at your option) any later
@@ -19,27 +17,11 @@
  *
  */
 
-#ifndef _SOCKET_H
-#define _SOCKET_H
+#include "utils.h"
+#include "string.h"
+#include "stdio.h"
 
-#include <netinet/in.h>
-#include <stdint.h>
-
-#include "config/config.h"
-
-#if config_socklen_t != 1
-#define socklen_t uint32_t
-#endif
-
-#ifndef INADDR_LOOPBACK
-#define INADDR_LOOPBACK 0x7f000001
-#endif
-
-extern int so_resolv(struct in_addr *host, const char *name);
-extern int so_connect(struct in_addr host, int port);
-extern int so_listen(int port, struct in_addr source);
-extern int so_dataready(int fd);
-extern int so_closed(int fd);
-extern int so_recvln(int fd, char **buf, int *size);
-
-#endif /* _SOCKET_H */
+extern char *gen_407_page(const char *http);
+extern char *gen_401_page(const char *http, const char *host, int port);
+extern char *gen_denied_page(const char *ip);
+extern char *gen_502_page(const char *http, const char *msg);

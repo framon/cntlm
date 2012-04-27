@@ -22,13 +22,29 @@
 #ifndef _HTTP_H
 #define _HTTP_H
 
-#include "utils.h"
+#include <stdint.h>
 
+#include "utils.h"
+#include "auth.h"
+
+/*
+ * A couple of shortcuts for if statements
+ */
+#define CONNECT(data)	((data) && (data)->req && !strcasecmp("CONNECT", (data)->method))
+#define HEAD(data)	((data) && (data)->req && !strcasecmp("HEAD", (data)->method))
+#define GET(data)	((data) && (data)->req && !strcasecmp("GET", (data)->method))
+
+typedef long long int length_t;
+
+extern int is_http_header(const char *src);
+extern char *get_http_header_name(const char *src);
+extern char *get_http_header_value(const char *src);
+extern int http_parse_basic(hlist_t headers, const char *header, struct auth_s *tcreds);
 extern int headers_recv(int fd, rr_data_t data);
 extern int headers_send(int fd, rr_data_t data);
-extern int data_drop(int src, int size);
-extern int data_send(int dst, int src, int size);
-extern int chunked_data_send(int dst, int src);
 extern int tunnel(int cd, int sd);
+extern length_t http_has_body(rr_data_t request, rr_data_t response);
+extern int http_body_send(int writefd, int readfd, rr_data_t request, rr_data_t response);
+extern int http_body_drop(int fd, rr_data_t response);
 
 #endif /* _HTTP_H */

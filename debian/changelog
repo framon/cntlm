@@ -1,3 +1,12 @@
+cntlm (0.92.3-1) unstable; urgency=low
+
+  * New upstream release. Closes: #652725, #588920.
+  * Fix Init script error, thanks Martijn. Closes: #588683.
+  * Correct spellings in man page.
+  * Update Standards Version, no changes needed.
+
+ -- David Watson <dwatson@debian.org>  Fri, 27 Apr 2012 15:08:17 +0100
+
 cntlm (0.35.1-5) unstable; urgency=low
 
   * Fix lintian errors in debian/copyright 
