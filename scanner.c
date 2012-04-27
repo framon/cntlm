@@ -131,8 +131,14 @@ int scanner_hook(rr_data_t request, rr_data_t response, struct auth_s *credentia
 
 					if ((pos = strstr(line, "To be downloaded"))) {
 						filesize = atol(pos+16);
-						if (debug)
-							printf("scanner_hook: file size detected: %ld KiBs (max: %ld)\n", filesize/1024, maxKBs);
+						if (debug) {
+							if (filesize > 0) {
+								printf("scanner_hook: file size detected: %ld KiBs (max: %ld)\n", filesize/1024, maxKBs);
+							} else {
+								printf("scanner_hook: file size unknown -- quitting\n");
+								break;
+							}
+						}
 
 						if (maxKBs && (maxKBs == 1 || filesize/1024 > maxKBs))
 							break;
@@ -145,7 +151,7 @@ int scanner_hook(rr_data_t request, rr_data_t response, struct auth_s *credentia
 						 */
 						headers_initiated = 1;
 						tmp = new(MINIBUF_SIZE);
-						snprintf(tmp, MINIBUF_SIZE, "HTTP/1.%s 200 OK\r\n", request->http);
+						snprintf(tmp, MINIBUF_SIZE, "%s 200 OK\r\n", request->http);
 						w = write(cd, tmp, strlen(tmp));
 						free(tmp);
 					}

@@ -22,7 +22,9 @@ configure-stamp:
 	./configure
 	touch configure-stamp
 
-build: build-stamp
+build: build-arch build-indep
+build-arch: build-stamp
+build-indep: build-stamp
 
 build-stamp: configure-stamp
 	dh_testdir
@@ -65,7 +67,6 @@ binary-arch: build install
 	cp debian/lintian-override debian/cntlm/usr/share/lintian/overrides/cntlm
 	dh_installdebconf	
 	dh_installinit -n
-	dh_installifupdown
 	dh_installman doc/cntlm.1
 	dh_link
 	dh_strip

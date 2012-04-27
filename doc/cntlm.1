@@ -124,7 +124,7 @@ username in the password dialog: "domain\\username".
 .B -c <filename>
 Configuration file. Command-line options, if used, override its single options or are added at the top of the
 list for multi options (tunnels, parent proxies, etc) with the exception of ACLs, which are completely
-overriden. Use \fI/dev/null\fP to disable any config file.
+overridden. Use \fI/dev/null\fP to disable any config file.
 
 .TP
 .B -D IP/mask\ \ \ \ (Deny)
@@ -191,7 +191,7 @@ password prompt is issued. Use this option only from shell.
 .TP
 .B -L [<saddr>:]<lport>:<rhost>:<rport>\ \ \ \ (Tunnel)
 Tunnel definition. The syntax is the same as in OpenSSH's local forwarding (\fB-L\fP), with a new optional
-prefix, \fIsaddr\fP - the source IP address to bind the \fIlport\fP to. \fBCntlm\fP will listen for incomming
+prefix, \fIsaddr\fP - the source IP address to bind the \fIlport\fP to. \fBCntlm\fP will listen for incoming
 connections on the local port \fIlport\fP, forwarding every new connection through the parent proxy to the
 \fIrhost\fP:\fIrport\fP (authenticating on the go). This option can be used multiple times for unlimited
 number of tunnels, with or without the \fIsaddr\fP option. See \fB-g\fP for the details concerning local port
@@ -365,8 +365,8 @@ Configuration file is basically an INI file, except there are no "=" between key
 whitespace delimited keyword and value pairs. Apart from that, there are sections as well, they have the usual
 "[section_name]" syntax. Comment begins with a hash "#" or a semicolon ";" and can be anywhere in the file.
 Everything after the mark up until EOL is a comment. Values can contain any characters, including whitespace.
-You \fIcan\fP use double quotes to set a value ending/beginning with a "space" character or containing a
-comment mark, but otherwise it's not necessary. There are no escape sequences or characters.
+You \fIcan\fP use double quotes around the value to set a string containing special characters like spaces,
+pound signs, etc. No escape sequences are allowed in quoted strings.
 
 There are two types of keywords, \fIlocal\fP and \fIglobal\fP. Local options specify authentication details
 per domain (or location). Global keywords apply to all sections and proxies. They should be placed before all
@@ -423,7 +423,8 @@ Local port number for the \fBcntlm\fP's proxy service. See \fB-l\fP for more.
 
 .TP
 .B Password <password>
-Proxy account password.
+Proxy account password. As with any other option, the value (password) can be enclosed in double quotes (")
+in case it contains special characters like spaces, pound signs, etc.
 
 .ne 11
 .TP

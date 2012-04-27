@@ -28,6 +28,10 @@
 #include <arpa/inet.h>
 #include <strings.h>
 #include <errno.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+extern int h_errno;
 
 #include "utils.h"
 #include "globals.h"
@@ -43,8 +47,8 @@ int host_connect(const char *hostname, int port) {
 
 	errno = 0;
 	if (!so_resolv(&addr, hostname)) {
-		if (debug)
-			printf("so_resolv: %s failed\n", hostname);
+		//if (debug)
+		//	printf("so_resolv: %s failed (%d: %s)\n", hostname, h_errno, hstrerror(h_errno));
 		return -1;
 	}
 
@@ -64,7 +68,7 @@ int www_authenticate(int sd, rr_data_t request, rr_data_t response, struct auth_
 	strcpy(buf, "NTLM ");
 	len = ntlm_request(&tmp, creds);
 	if (len) {
-		to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
+		to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
 		free(tmp);
 	}
 
@@ -117,7 +121,7 @@ int www_authenticate(int sd, rr_data_t request, rr_data_t response, struct auth_
 				len = ntlm_response(&tmp, challenge, len, creds);
 				if (len > 0) {
 					strcpy(buf, "NTLM ");
-					to_base64(MEM(buf, unsigned char, 5), MEM(tmp, unsigned char, 0), len, BUFSIZE-5);
+					to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
 					request->headers = hlist_mod(request->headers, "Authorization", buf, 1);
 					free(tmp);
 				} else {

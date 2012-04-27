@@ -1,29 +1,11 @@
-cntlm (0.91~rc6-0ubuntu2) natty; urgency=low
+cntlm (0.92.3-1) unstable; urgency=low
 
-  * When a network interface goes up, before starting cntlm check whether
-    it is enabled in current runlevel (LP: #733537)
+  * New upstream release. Closes: #652725, #588920.
+  * Fix Init script error, thanks Martijn. Closes: #588683.
+  * Correct spellings in man page.
+  * Update Standards Version, no changes needed.
 
- -- Paolo Cancedda <paolo.cancedda@gmail.com>  Mon, 14 Mar 2011 23:55:56 +0100
-
-cntlm (0.91~rc6-0ubuntu1.1) maverick-proposed; urgency=low
-
-  * Remove unnecessary and invalid forever from start-stop-daemon's --retry
-    schedule (LP: #660515)
-
- -- Stefano Rivera <stefanor@ubuntu.com>  Sat, 16 Oct 2010 21:14:32 +0200
-
-cntlm (0.91~rc6-0ubuntu1) maverick; urgency=low
-
-  * New Upstream pre-release (LP: #649171)
-
- -- Stefano Rivera <stefanor@ubuntu.com>  Tue, 28 Sep 2010 18:05:06 +0200
-
-cntlm (0.35.1-5ubuntu1) maverick; urgency=low
-
-  * Add ifup.d script, as cntlm may start before required interface is up
-    (LP: #358298)
-
- -- Stefano Rivera <stefanor@ubuntu.com>  Tue, 06 Jul 2010 15:13:35 +0200
+ -- David Watson <dwatson@debian.org>  Fri, 27 Apr 2012 15:08:17 +0100
 
 cntlm (0.35.1-5) unstable; urgency=low
 
