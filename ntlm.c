@@ -19,6 +19,7 @@
  *
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -64,7 +65,7 @@ static int ntlm_calc_resp(char **dst, char *keys, char *challenge) {
 }
 
 static void ntlm2_calc_resp(char **nthash, int *ntlen, char **lmhash, int *lmlen, 
-		char *username, char *domain, char *passnt2, char *challenge, int tbofs, int tblen) {
+		char *passnt2, char *challenge, int tbofs, int tblen) {
 	char *tmp, *blob, *nonce, *buf;
 	int64_t tw;
 	int blen;
@@ -73,9 +74,13 @@ static void ntlm2_calc_resp(char **nthash, int *ntlen, char **lmhash, int *lmlen
 	VAL(nonce, uint64_t, 0) = ((uint64_t)random() << 32) | random();
 	tw = ((uint64_t)time(NULL) + 11644473600LLU) * 10000000LLU;
 
-	if (0 && debug) {
+	if (debug) {
 		tmp = printmem(nonce, 8, 7);
-		printf("NTLMv2:\n\t    Nonce: %s\n\tTimestamp: %lld\n", tmp, tw);
+#ifdef PRId64
+		printf("NTLMv2:\n\t    Nonce: %s\n\tTimestamp: %"PRId64"\n", tmp, tw);
+#else
+		printf("NTLMv2:\n\t    Nonce: %s\n\tTimestamp: %ld\n", tmp, tw);
+#endif
 		free(tmp);
 	}
 
@@ -208,6 +213,7 @@ int ntlm_request(char **dst, struct auth_s *creds) {
 	int dlen, hlen;
 	uint32_t flags = 0xb206;
 
+	*dst = NULL;
 	dlen = strlen(creds->domain);
 	hlen = strlen(creds->workstation);
 
@@ -222,8 +228,13 @@ int ntlm_request(char **dst, struct auth_s *creds) {
 			flags = 0xb205;
 		else if (creds->hashlm)
 			flags = 0xb206;
-		else
+		else {
+			if (debug) {
+				printf("You're requesting with empty auth_s?!\n");
+				dump_auth(creds);
+			}
 			return 0;
+		}
 	} else
 		flags = creds->flags;
 
@@ -349,7 +360,7 @@ int ntlm_response(char **dst, char *challenge, int challen, struct auth_s *creds
 	}
 
 	if (creds->hashntlm2) {
-		ntlm2_calc_resp(&nthash, &ntlen, &lmhash, &lmlen, creds->user, creds->domain, creds->passntlm2, challenge, tbofs, tblen);
+		ntlm2_calc_resp(&nthash, &ntlen, &lmhash, &lmlen, creds->passntlm2, challenge, tbofs, tblen);
 	}
 
 	if (creds->hashnt == 2) {

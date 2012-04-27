@@ -19,7 +19,9 @@
  *
  */
 
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -39,6 +41,7 @@ extern int debug;
  * gethostbyname() wrapper. Return 1 if OK, otherwise 0.
  */
 int so_resolv(struct in_addr *host, const char *name) {
+/*
 	struct hostent *resolv;
 
 	resolv = gethostbyname(name);
@@ -46,6 +49,41 @@ int so_resolv(struct in_addr *host, const char *name) {
 		return 0;
 
 	memcpy(host, resolv->h_addr_list[0], resolv->h_length);
+	return 1;
+*/
+	struct addrinfo hints, *res, *p;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	int rc = getaddrinfo(name, NULL, &hints, &res);
+	if (rc != 0) {
+		if (debug)
+			printf("so_resolv: %s failed: %s (%d)\n", name, gai_strerror(rc), rc);
+		return 0;
+	}
+
+	if (debug)
+		printf("Resolve %s:\n", name);
+	int addr_set = 0;
+	for (p = res; p != NULL; p = p->ai_next) {
+		struct sockaddr_in *ad = (struct sockaddr_in*)(p->ai_addr);
+		if (ad == NULL) {
+			freeaddrinfo(res);
+			return 0;
+		}
+		if (!addr_set) {
+			memcpy(host, &ad->sin_addr, sizeof(ad->sin_addr));
+			addr_set = 1;
+			if (debug)
+				printf("  -> %s\n", inet_ntoa(ad->sin_addr));
+		} else
+			if (debug)
+				printf("     %s\n", inet_ntoa(ad->sin_addr));
+	}
+
+	freeaddrinfo(res);
+
 	return 1;
 }
 
@@ -55,13 +93,15 @@ int so_resolv(struct in_addr *host, const char *name) {
  * Returns: socket descriptor
  */
 int so_connect(struct in_addr host, int port) {
-	int fd;
+	int flags, fd, rc;
 	struct sockaddr_in saddr;
+	// struct timeval tv;
+	// fd_set fds;
 
-	fd = socket(PF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
-		perror("cannot create socket()");
-		exit(1);
+	if ((fd = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+		if (debug)
+			printf("so_connect: create: %s\n", strerror(errno));
+		return -1;
 	}
 
 	memset(&saddr, 0, sizeof(saddr));
@@ -69,8 +109,50 @@ int so_connect(struct in_addr host, int port) {
 	saddr.sin_port = htons(port);
 	saddr.sin_addr = host;
 
-	if (connect(fd, (struct sockaddr *)&saddr, sizeof(saddr)) < 0)
+	if ((flags = fcntl(fd, F_GETFL, 0)) < 0) {
+		if (debug)
+			printf("so_connect: get flags: %s\n", strerror(errno));
+		close(fd);
 		return -1;
+	}
+
+	/* NON-BLOCKING connect with timeout
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		if (debug)
+			printf("so_connect: set non-blocking: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	*/
+
+	rc = connect(fd, (struct sockaddr *)&saddr, sizeof(saddr));
+
+	/*
+	printf("connect = %d\n", rc);
+	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS)) {
+		FD_ZERO(&fds);
+		FD_SET(fd, &fds);
+		tv.tv_sec = 10;
+		tv.tv_usec = 0;
+		printf("select!\n");
+		rc = select(fd+1, NULL, &fds, NULL, &tv) - 1;
+		printf("select = %d\n", rc);
+	}
+	*/
+
+	if (rc < 0) {
+		if (debug)
+			printf("so_connect: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+		if (debug)
+			printf("so_connect: set blocking: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
 
 	return fd;
 }
@@ -86,8 +168,10 @@ int so_listen(int port, struct in_addr source) {
 
 	fd = socket(PF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
-		perror("Cannot create socket");
-		exit(1);
+		if (debug)
+			printf("so_listen: new socket: %s\n", strerror(errno));
+		close(fd);
+		return -1;
 	}
 
 	clen = 1;
@@ -99,11 +183,14 @@ int so_listen(int port, struct in_addr source) {
 
 	if (bind(fd, (struct sockaddr *)&saddr, sizeof(saddr))) {
 		syslog(LOG_ERR, "Cannot bind port %d: %s!\n", port, strerror(errno));
+		close(fd);
 		return -1;
 	}
 
-	if (listen(fd, 5))
+	if (listen(fd, 5)) {
+		close(fd);
 		return -1;
+	}
 
 	return fd;
 }
@@ -160,10 +247,7 @@ int so_closed(int fd) {
  * the performance was very similar. Given the fact that it keeps us
  * from creating a whole buffering scheme around the socket (HTTP 
  * connection is both line and block oriented, switching back and forth),
- * it is actually quite cool. ;)
- *
- * Streams using fdopen() didn't yield such comfort (memory allocation,
- * split r/w FILE *args in functions, etc) and simplicity.
+ * it is actually OK.
  */
 int so_recvln(int fd, char **buf, int *size) {
 	int len = 0;
@@ -179,7 +263,7 @@ int so_recvln(int fd, char **buf, int *size) {
 		(*buf)[len++] = c;
 
 		/*
-		 * end of buffer, still no EOL?
+		 * End of buffer, still no EOL? Resize the buffer
 		 */
 		if (len == *size-1 && c != '\n') {
 			if (debug)
@@ -192,7 +276,7 @@ int so_recvln(int fd, char **buf, int *size) {
 				*buf = tmp;
 		}
 	}
-	VAL(*buf, char, len) = 0;
+	(*buf)[len] = 0;
 
 	return r;
 }
