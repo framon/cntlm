@@ -446,7 +446,9 @@ beginning:
 					&& strcasecmp(hostname, data[0]->hostname)) {
 				if (debug)
 					printf("\n******* F RETURN: %s *******\n", data[0]->url);
-				if (authok)
+				if (authok && data[0]->http_version >= 11
+						&& (hlist_subcmp(data[0]->headers, "Proxy-Connection", "keep-alive")
+							|| hlist_subcmp(data[0]->headers, "Connection", "keep-alive")))
 					proxy_alive = 1;
 
 				rc = dup_rr_data(data[0]);
@@ -465,7 +467,7 @@ shortcut:
 			/*
 			 * Modify request headers.
 			 *
-			 * Try to request keep-alive for every connection. We keep them in a pool
+			 * Try to request keep-alive for every client supporting HTTP/1.1+. We keep them in a pool
 			 * for future reuse.
 			 */
 			if (loop == 0 && data[0]->req) {
@@ -499,13 +501,14 @@ shortcut:
 				}
 
 				/*
-				 * Also remove runaway P-A from the client (e.g. Basic from N-t-B), which might 
-				 * cause some ISAs to deny us, even if the connection is already auth'd.
+				 * Force proxy keep-alive if the client can handle it (HTTP >= 1.1)
 				 */
-				data[0]->headers = hlist_mod(data[0]->headers, "Proxy-Connection", "keep-alive", 1);
+				if (data[0]->http_version >= 11)
+					data[0]->headers = hlist_mod(data[0]->headers, "Proxy-Connection", "keep-alive", 1);
 
 				/*
-				 * Remove all Proxy-Authorization headers from client
+				 * Also remove runaway P-A from the client (e.g. Basic from N-t-B), which might 
+				 * cause some ISAs to deny us, even if the connection is already auth'd.
 				 */
 				while (hlist_get(data[loop]->headers, "Proxy-Authorization")) {
 					data[loop]->headers = hlist_del(data[loop]->headers, "Proxy-Authorization");
@@ -672,8 +675,14 @@ shortcut:
 			 * This way, we also tell our caller that proxy keep-alive is impossible.
 			 */
 			if (loop == 1) {
-				proxy_alive = hlist_subcmp(data[loop]->headers, "Proxy-Connection", "keep-alive");
-				if (!proxy_alive) {
+				proxy_alive = hlist_subcmp(data[1]->headers, "Proxy-Connection", "keep-alive")
+					&& data[0]->http_version >= 11;
+				if (proxy_alive) {
+					data[1]->headers = hlist_mod(data[1]->headers, "Proxy-Connection", "keep-alive", 1);
+					data[1]->headers = hlist_mod(data[1]->headers, "Connection", "keep-alive", 1);
+				} else {
+					data[1]->headers = hlist_mod(data[1]->headers, "Proxy-Connection", "close", 1);
+					data[1]->headers = hlist_mod(data[1]->headers, "Connection", "close", 1);
 					if (debug)
 						printf("PROXY CLOSING CONNECTION\n");
 					rc = (void *)-1;

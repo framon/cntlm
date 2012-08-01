@@ -1,3 +1,10 @@
+cntlm (0.92.3-1ubuntu1) quantal; urgency=low
+
+  * Cherry-pick r306 from 0.93 to properly handle non-HTTP/1.1 keep-alive
+    (LP: #1009436)
+
+ -- Graham Inggs <graham@nerve.org.za>  Wed, 01 Aug 2012 23:04:45 +0200
+
 cntlm (0.92.3-1) unstable; urgency=low
 
   * New upstream release. Closes: #652725, #588920.
