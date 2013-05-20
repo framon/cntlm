@@ -288,6 +288,30 @@ plist_t noproxy_add(plist_t list, char *spec) {
 }
 
 int noproxy_match(const char *addr) {
+	struct hostent *he;
+	struct in_addr **addr_list;
+	char *ip;
+	int i;
+
+	if (noproxy_check(addr))
+		return 1;
+
+	if ( (he = gethostbyname(addr)) != NULL ) {
+		addr_list = (struct in_addr **) he->h_addr_list;
+
+		for(i = 0; addr_list[i] != NULL; i++) {
+			ip = inet_ntoa(*addr_list[i]);
+
+			if (noproxy_check(ip))
+				return 1;
+		}
+
+	}
+
+	return 0;
+}
+
+int noproxy_check(const char *addr) {
 	plist_t list;
 
 	list = noproxy_list;
