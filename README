@@ -1,3 +1,13 @@
+Clone of lp:ubuntu/cntlm with my local changes, as feature 'Resolve Hostnames' was
+rejected on upstream.
+
+Resolve hostnames prior to matching with NoProxy
+http://sourceforge.net/p/cntlm/feature-requests/32/
+
+--
+Fábio Ramon
+
+
 Installation using packages
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
