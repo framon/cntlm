@@ -104,6 +104,7 @@ hlist_t header_list = NULL;			/* forward_request() */
 hlist_t users_list = NULL;			/* socks5_thread() */
 plist_t scanner_agent_list = NULL;		/* scanner_hook() */
 plist_t noproxy_list = NULL;			/* proxy_thread() */
+plist_t yesproxy_list = NULL;			/* proxy_thread() */
 
 /*
  * General signal handler. If in debug mode, quit immediately.
@@ -273,13 +274,13 @@ void tunnel_add(plist_t *list, char *spec, int gateway) {
 /*
  * Add no-proxy hostname/IP
  */
-plist_t noproxy_add(plist_t list, char *spec) {
+plist_t proxy_list_add(const char *type, plist_t list, char *spec) {
 	char *tok, *save;
 
 	tok = strtok_r(spec, ", ", &save);
 	while ( tok != NULL ) {
 		if (debug)
-			printf("Adding no-proxy for: '%s'\n", tok);
+			printf("Adding %s-proxy for: '%s'\n", type, tok);
 		list = plist_add(list, 0, strdup(tok));
 		tok = strtok_r(NULL, ", ", &save);
 	}
@@ -287,13 +288,46 @@ plist_t noproxy_add(plist_t list, char *spec) {
 	return list;
 }
 
-int noproxy_match(const char *addr) {
+void noproxy_add(char *spec) {
+	noproxy_list = proxy_list_add("no", noproxy_list, spec);
+}
+
+void yesproxy_add(char *spec) {
+	yesproxy_list = proxy_list_add("yes", yesproxy_list, spec);
+}
+
+int proxy_list_check(const char *type, plist_t list, const char *addr) {
+
+	while (list) {
+		if (list->aux && strlen(list->aux)
+				&& fnmatch(list->aux, addr, 0) == 0) {
+			if (debug)
+				printf("MATCH: %s (%s)\n", addr, (char *)list->aux);
+			return 1;
+		} else if (debug)
+			printf("   %s: %s (%s)\n", type, addr, (char *)list->aux);
+
+		list = list->next;
+	}
+
+	return 0;
+}
+
+int noproxy_check(const char *addr) {
+	return proxy_list_check("NO", noproxy_list, addr);
+}
+
+int yesproxy_check(const char *addr) {
+	return proxy_list_check("YES", yesproxy_list, addr);
+}
+
+int proxy_match(const char *addr) {
 	struct hostent *he;
 	struct in_addr **addr_list;
 	char *ip;
 	int i;
 
-	if (noproxy_check(addr))
+	if (noproxy_check(addr) && !yesproxy_check(addr))
 		return 1;
 
 	if ( (he = gethostbyname(addr)) != NULL ) {
@@ -302,29 +336,10 @@ int noproxy_match(const char *addr) {
 		for(i = 0; addr_list[i] != NULL; i++) {
 			ip = inet_ntoa(*addr_list[i]);
 
-			if (noproxy_check(ip))
+			if (noproxy_check(ip) && !yesproxy_check(addr))
 				return 1;
 		}
 
-	}
-
-	return 0;
-}
-
-int noproxy_check(const char *addr) {
-	plist_t list;
-
-	list = noproxy_list;
-	while (list) {
-		if (list->aux && strlen(list->aux)
-				&& fnmatch(list->aux, addr, 0) == 0) {
-			if (debug)
-				printf("MATCH: %s (%s)\n", addr, (char *)list->aux);
-			return 1;
-		} else if (debug)
-			printf("   NO: %s (%s)\n", addr, (char *)list->aux);
-
-		list = list->next;
 	}
 
 	return 0;
@@ -365,7 +380,7 @@ void *proxy_thread(void *thread_data) {
 
 			keep_alive = hlist_subcmp(request->headers, "Proxy-Connection", "keep-alive");
 
-			if (noproxy_match(request->hostname))
+			if (proxy_match(request->hostname))
 				ret = direct_request(thread_data, request);
 			else
 				ret = forward_request(thread_data, request);
@@ -409,7 +424,7 @@ void *tunnel_thread(void *thread_data) {
 	if ((pos = strchr(hostname, ':')) != NULL)
 		*pos = 0;
 
-	if (noproxy_match(hostname))
+	if (proxy_match(hostname))
 		direct_tunnel(thread_data);
 	else
 		forward_tunnel(thread_data);
@@ -618,7 +633,7 @@ void *socks5_thread(void *thread_data) {
 		goto bailout;
 
 	i = 0;
-	if (noproxy_match(thost)) {
+	if (proxy_match(thost)) {
 		sd = host_connect(thost, ntohs(port));
 		i = (sd >= 0);
 	} else {
@@ -800,7 +815,7 @@ int main(int argc, char **argv) {
 				magic_detect = strdup(optarg);
 				break;
 			case 'N':
-				noproxy_list = noproxy_add(noproxy_list, tmp=strdup(optarg));
+				noproxy_add(tmp=strdup(optarg));
 				free(tmp);
 				break;
 			case 'O':
@@ -1112,7 +1127,14 @@ int main(int argc, char **argv) {
 
 		while ((tmp = config_pop(cf, "NoProxy"))) {
 			if (strlen(tmp)) {
-				noproxy_list = noproxy_add(noproxy_list, tmp);
+				noproxy_add(tmp);
+			}
+			free(tmp);
+		}
+
+		while ((tmp = config_pop(cf, "YesProxy"))) {
+			if (strlen(tmp)) {
+				yesproxy_add(tmp);
 			}
 			free(tmp);
 		}
@@ -1625,6 +1647,7 @@ bailout:
 	hlist_free(header_list);
 	plist_free(scanner_agent_list);
 	plist_free(noproxy_list);
+	plist_free(yesproxy_list);
 	plist_free(tunneld_list);
 	plist_free(proxyd_list);
 	plist_free(socksd_list);
